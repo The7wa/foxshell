@@ -1,5 +1,5 @@
 'use strict';
-/* global Terminal, FitAddon */
+/* global Terminal, FitAddon, SearchAddon */
 
 // ---------------- 状态 ----------------
 let conns = [];
@@ -41,6 +41,19 @@ const DEFAULT_CMDS = [
   { name: '系统日志 50 行', cmd: 'journalctl -n 50 --no-pager' },
 ];
 let cmdList = store.get('foxshell.cmds', null) || DEFAULT_CMDS.map((c) => ({ ...c }));
+
+// 批量执行：选中的广播目标 tabId
+let broadcastTargets = new Set();
+
+// 主题预设
+const TERM_PRESETS = [
+  { name: '经典黑', bg: '#101418', fg: '#d6dce2' },
+  { name: '深灰', bg: '#2d2d2d', fg: '#cccccc' },
+  { name: '深蓝', bg: '#0d2a4a', fg: '#cfe3ff' },
+  { name: 'Solarized', bg: '#002b36', fg: '#93a1a1' },
+  { name: 'Matrix', bg: '#001100', fg: '#33ff33' },
+  { name: '浅色', bg: '#ffffff', fg: '#333333' },
+];
 
 // ---------------- 工具 ----------------
 function b64ToBytes(b64) {
@@ -120,7 +133,17 @@ async function persist() {
     groups: allGroupNames(),
     secrets: {},
   });
-  if (updated && updated.connections) conns = updated.connections;
+  // 只回填加密字段，保持 conns 内对象引用不变（tab.conn 依赖同一引用）
+  if (updated && updated.connections) {
+    for (const u of updated.connections) {
+      const c = conns.find((x) => x.id === u.id);
+      if (c) {
+        c.passwordEnc = u.passwordEnc;
+        c.passphraseEnc = u.passphraseEnc;
+        c.jumpPasswordEnc = u.jumpPasswordEnc;
+      }
+    }
+  }
 }
 
 // ---------------- 连接列表（文件夹分组 + 拖拽归组） ----------------
@@ -276,6 +299,13 @@ function openConnDialog(conn, clone) {
   F('password').value = '';
   F('passphrase').value = '';
   F('password').placeholder = conn && !clone ? '留空则保持原密码' : '';
+  F('useJump').checked = !!(conn && conn.useJump);
+  F('jumpHost').value = conn ? conn.jumpHost || '' : '';
+  F('jumpPort').value = conn ? conn.jumpPort || 22 : 22;
+  F('jumpUser').value = conn ? conn.jumpUsername || '' : '';
+  F('jumpPassword').value = '';
+  F('jumpPassword').placeholder = conn && !clone ? '留空则保持原密码' : '';
+  $('rowJump').style.display = F('useJump').checked ? '' : 'none';
   $('keyPathText').value = pickedKeyPath || '';
   $('groupSuggestions').innerHTML = allGroupNames().map((g) => `<option value="${escapeHtml(g)}">`).join('');
   toggleAuthRows();
@@ -296,6 +326,7 @@ async function saveConnForm(e) {
     const id = editingConnId || uid().replace('t', 'c');
     const old = conns.find((c) => c.id === id);
     const group = F('group').value.trim();
+    const useJump = F('useJump').checked;
     const rec = {
       id,
       name: F('name').value.trim() || F('host').value.trim(),
@@ -307,18 +338,43 @@ async function saveConnForm(e) {
       passwordEnc: old ? old.passwordEnc : '',
       keyPath: F('authType').value === 'key' ? pickedKeyPath : '',
       passphraseEnc: old ? old.passphraseEnc : '',
+      useJump,
+      jumpHost: useJump ? F('jumpHost').value.trim() : '',
+      jumpPort: useJump ? Number(F('jumpPort').value) || 22 : 22,
+      jumpUsername: useJump ? F('jumpUser').value.trim() : '',
+      jumpPasswordEnc: old ? old.jumpPasswordEnc || '' : '',
+      forwards: old ? old.forwards || [] : [],
     };
     if (!rec.keyPath && rec.authType === 'key') {
       toast('请选择私钥文件', true);
       return;
     }
+    if (useJump && !rec.jumpHost) {
+      toast('请填写跳板机地址', true);
+      return;
+    }
     if (group && !allGroupNames().includes(group)) extraGroups = [...extraGroups, group];
-    const secrets = { [id]: { password: F('password').value, passphrase: F('passphrase').value } };
-    if (old) conns = conns.map((c) => (c.id === id ? rec : c));
+    const secrets = {
+      [id]: {
+        password: F('password').value,
+        passphrase: F('passphrase').value,
+        jumpPassword: F('jumpPassword').value,
+      },
+    };
+    if (old) Object.assign(old, rec); // 原地更新，保持引用（tab.conn 同步）
     else conns.push(rec);
     store.set('foxshell.groups', extraGroups);
     const updated = await window.api.saveConns({ connections: conns, groups: allGroupNames(), secrets });
-    if (updated && updated.connections) conns = updated.connections;
+    if (updated && updated.connections) {
+      for (const u of updated.connections) {
+        const c = conns.find((x) => x.id === u.id);
+        if (c) {
+          c.passwordEnc = u.passwordEnc;
+          c.passphraseEnc = u.passphraseEnc;
+          c.jumpPasswordEnc = u.jumpPasswordEnc;
+        }
+      }
+    }
     $('connDialog').close();
     renderConnList();
     toast('连接配置已保存');
@@ -362,6 +418,7 @@ function createTab(conn) {
   renderTabs();
   activateTab(id);
   addPane(tab, -1); // 第一个终端面板
+  if (cmdVisible) renderBroadcast();
   window.api.connect(id, conn);
 }
 
@@ -389,19 +446,22 @@ function addPane(tab, index, direction) {
     <div class="pane-tools">
       <button data-a="splitH" title="复制终端（左右分屏，同一连接新开终端）">⧉ 复制</button>
       <button data-a="splitV" title="上下分屏">⬓ 上下</button>
+      <button data-a="log" title="导出此终端缓冲区为日志文件">📜 日志</button>
       <button data-a="close" class="pclose" title="关闭此终端">✕</button>
     </div>`;
 
   const term = new Terminal(termOptions());
   const fit = new FitAddon.FitAddon();
+  const search = new SearchAddon.SearchAddon();
   term.loadAddon(fit);
+  term.loadAddon(search);
   // xterm 需要挂载到独立内容层，避免与悬浮工具栏互相干扰
   const inner = document.createElement('div');
   inner.style.cssText = 'position:absolute;inset:4px 0 0 8px;';
   el.appendChild(inner);
   term.open(inner);
 
-  const pane = { id: paneId, el, inner, term, fit };
+  const pane = { id: paneId, el, inner, term, fit, search };
   const at = index < 0 || index > tab.panes.length ? tab.panes.length : index;
   tab.panes.splice(at, 0, pane);
 
@@ -417,6 +477,10 @@ function addPane(tab, index, direction) {
   el.querySelector('[data-a=splitV]').addEventListener('click', (e) => {
     e.stopPropagation();
     addPane(tab, tab.panes.indexOf(pane) + 1, 'column');
+  });
+  el.querySelector('[data-a=log]').addEventListener('click', (e) => {
+    e.stopPropagation();
+    exportPaneLog(tab, pane);
   });
   el.querySelector('[data-a=close]').addEventListener('click', (e) => {
     e.stopPropagation();
@@ -493,11 +557,50 @@ function fitAllPanes(tab) {
 function closePane(tab, pane) {
   window.api.closePane(tab.id, pane.id);
   try { pane.term.dispose(); } catch (_) {}
+  pane.el.remove();
   tab.panes = tab.panes.filter((p) => p !== pane);
   if (!tab.panes.length) return closeTab(tab.id);
   relayoutPanes(tab);
   if (tab.activePane === pane.id) setActivePane(tab, tab.panes[0]);
   fitAllPanes(tab);
+}
+
+// 导出终端缓冲区为日志文件
+function exportPaneLog(tab, pane) {
+  const buf = pane.term.buffer.active;
+  const lines = [];
+  for (let i = 0; i < buf.length; i++) {
+    lines.push(buf.getLine(i).translateToString(true));
+  }
+  while (lines.length && !lines[lines.length - 1]) lines.pop();
+  const name = `${tab.conn.host}-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.log`;
+  window.api.saveText(lines.join('\r\n'), name).then((r) => {
+    if (r.ok) toast('日志已保存：' + r.path);
+  });
+}
+
+// ---------- 终端内搜索（Ctrl+F，作用于当前活动面板） ----------
+function activeSearch() {
+  const tab = tabs.get(activeTabId);
+  if (!tab) return null;
+  const pane = tab.panes.find((p) => p.id === tab.activePane) || tab.panes[0];
+  return pane ? pane.search : null;
+}
+function openSearch() {
+  if (!tabs.get(activeTabId)) return;
+  $('searchBar').classList.remove('hidden');
+  $('searchInput').focus();
+  $('searchInput').select();
+}
+function closeSearch() {
+  $('searchBar').classList.add('hidden');
+  const s = activeSearch();
+  if (s) { try { s.clearDecorations(); } catch (_) {} }
+  const tab = tabs.get(activeTabId);
+  if (tab && tab.activePane) {
+    const p = tab.panes.find((x) => x.id === tab.activePane);
+    if (p) try { p.term.focus(); } catch (_) {}
+  }
 }
 
 function activateTab(id) {
@@ -526,6 +629,8 @@ function closeTab(id) {
   }
   tab.wrap.remove();
   tabs.delete(id);
+  broadcastTargets.delete(id);
+  if (cmdVisible) renderBroadcast();
   if (activeTabId === id) {
     const rest = [...tabs.keys()];
     if (rest.length) activateTab(rest[rest.length - 1]);
@@ -612,6 +717,19 @@ function openTermDialog() {
   F('size').value = termCfg.size;
   F('cursor').value = termCfg.cursor;
   F('blink').checked = termCfg.blink;
+  const row = $('presetRow');
+  row.innerHTML = '';
+  for (const p of TERM_PRESETS) {
+    const chip = document.createElement('button');
+    chip.type = 'button';
+    chip.className = 'preset-chip';
+    chip.innerHTML = `<span class="preset-dot" style="background:${p.bg}"></span>${escapeHtml(p.name)}`;
+    chip.addEventListener('click', () => {
+      F('bg').value = p.bg;
+      F('fg').value = p.fg;
+    });
+    row.appendChild(chip);
+  }
   $('termDialog').showModal();
 }
 
@@ -651,6 +769,7 @@ function handleEvent(evt) {
     // 远端 shell 关闭（如连接断开）；面板由 status=closed 统一处理
   } else if (type === 'status') {
     tab.state = payload.state;
+    tab.statusMsg = payload.message || '';
     if (payload.state === 'connected') {
       if (!tab.panes.length) addPane(tab, -1);
       else window.api.openPane(tab.id, tab.panes[0].id);
@@ -663,6 +782,7 @@ function handleEvent(evt) {
     }
     renderTabs();
     renderConnList();
+    if (cmdVisible) renderBroadcast();
     if (tab.id === activeTabId) { renderMonitor(); updateDisconnectBtn(); }
   } else if (type === 'stats') {
     tab.stats = payload;
@@ -691,6 +811,66 @@ function handleEvent(evt) {
     }, 600);
   } else if (type === 'transfer-error') {
     toast('传输失败：' + payload.message, true);
+  } else if (type === 'forward-state') {
+    fwdState.set(payload.id, payload.active);
+    if (!$('fwdDialog').classList.contains('hidden') || $('fwdDialog').open) renderFwdList();
+  } else if (type === 'forward-error') {
+    fwdState.set(payload.id, false);
+    toast('端口转发失败：' + payload.message, true);
+    if ($('fwdDialog').open) renderFwdList();
+  }
+}
+
+// ---------- 端口转发对话框 ----------
+const fwdState = new Map(); // rule.id -> 是否已启动（运行时状态）
+
+function currentConn() {
+  const tab = tabs.get(activeTabId);
+  if (!tab) return null;
+  // 优先从 conns 里取，避免 tab.conn 与列表对象脱钩
+  return conns.find((c) => c.id === tab.connId) || tab.conn;
+}
+
+function openFwdDialog() {
+  const conn = currentConn();
+  if (!conn) { toast('请先选中一个已连接的服务器标签', true); return; }
+  if (!Array.isArray(conn.forwards)) conn.forwards = [];
+  renderFwdList();
+  $('fwdDialog').showModal();
+}
+
+function renderFwdList() {
+  const conn = currentConn();
+  const box = $('fwdList');
+  if (!conn) return;
+  box.innerHTML = '';
+  if (!conn.forwards.length) {
+    box.innerHTML = '<div class="empty-list">还没有转发规则<br>在下方添加：本地端口 → 目标主机:目标端口</div>';
+    return;
+  }
+  for (const r of conn.forwards) {
+    const on = fwdState.get(r.id);
+    const row = document.createElement('div');
+    row.className = 'fwd-row';
+    row.innerHTML = `
+      <span class="fwd-state ${on ? 'on' : ''}" title="${on ? '转发中' : '未启动'}"></span>
+      <span class="fwd-text">127.0.0.1:${r.localPort} → ${escapeHtml(r.dstHost)}:${r.dstPort}</span>
+      <button class="mini-btn" data-a="toggle">${on ? '停止' : '启动'}</button>
+      <button class="mini-btn" data-a="del">🗑</button>`;
+    row.querySelector('[data-a=toggle]').addEventListener('click', () => {
+      const tab = tabs.get(activeTabId);
+      if (!tab || tab.state !== 'connected') { toast('连接已断开，无法转发', true); return; }
+      if (on) window.api.fwdStop(tab.id, r.id);
+      else window.api.fwdStart(tab.id, { id: r.id, localPort: r.localPort, dstHost: r.dstHost, dstPort: r.dstPort });
+    });
+    row.querySelector('[data-a=del]').addEventListener('click', async () => {
+      if (on) window.api.fwdStop(activeTabId, r.id);
+      conn.forwards = conn.forwards.filter((x) => x.id !== r.id);
+      fwdState.delete(r.id);
+      await persist();
+      renderFwdList();
+    });
+    box.appendChild(row);
   }
 }
 
@@ -705,8 +885,9 @@ function renderMonitor() {
   };
   if (!tab) { status.textContent = '未连接'; status.className = ''; return; }
   if (tab.state !== 'connected') {
-    status.textContent = tab.state === 'connecting' ? '连接中...' :
-      tab.state === 'failed' ? '连接失败' : '已断开';
+    status.textContent = tab.state === 'connecting'
+      ? ('连接中...' + (tab.statusMsg ? ' ' + tab.statusMsg : ''))
+      : tab.state === 'failed' ? '连接失败' : '已断开';
     status.className = tab.state === 'failed' ? 'err' : '';
     setBar($('monCpu'), 0); setBar($('monMem'), 0);
     $('monNet').textContent = '↓ -- ↑ --';
@@ -753,6 +934,7 @@ function refreshCmdPanel() {
   $('cmdPanel').classList.toggle('hidden', !cmdVisible);
   $('cmdSplitter').classList.toggle('hidden', !cmdVisible);
   $('btnToggleCmd').classList.toggle('active', cmdVisible);
+  if (cmdVisible) renderBroadcast();
 }
 
 function makeVResizable(handle, panel, { dir, min, max, key }) {
@@ -804,10 +986,11 @@ function restorePanelWidths() {
 function renderCmdList() {
   const box = $('cmdList');
   box.innerHTML = '';
+  renderBroadcast();
   for (const [i, c] of cmdList.entries()) {
     const el = document.createElement('div');
     el.className = 'cmd-block';
-    el.title = c.cmd + '\n点击在当前终端执行';
+    el.title = c.cmd + '\n点击执行';
     el.innerHTML = `
       <div class="cmd-name">${escapeHtml(c.name)}</div>
       <div class="cmd-text">${escapeHtml(c.cmd)}</div>
@@ -825,7 +1008,43 @@ function renderCmdList() {
   }
 }
 
+// 广播目标：列出所有已连接的标签
+function renderBroadcast() {
+  const box = $('broadcastList');
+  box.innerHTML = '';
+  const connected = [...tabs.values()].filter((t) => t.state === 'connected');
+  if (!connected.length) {
+    box.innerHTML = '<span class="none">暂无已连接的服务器</span>';
+    return;
+  }
+  for (const t of connected) {
+    const chip = document.createElement('span');
+    const on = broadcastTargets.has(t.id);
+    chip.className = 'bcast-chip' + (on ? ' on' : '');
+    chip.textContent = (on ? '✓ ' : '') + t.title;
+    chip.title = t.conn.username + '@' + t.conn.host;
+    chip.addEventListener('click', () => {
+      if (broadcastTargets.has(t.id)) broadcastTargets.delete(t.id);
+      else broadcastTargets.add(t.id);
+      renderBroadcast();
+    });
+    box.appendChild(chip);
+  }
+}
+
 function runCommand(c) {
+  // 选中了广播目标 → 同步发到所有选中终端；否则只发当前终端
+  const targets = [...broadcastTargets]
+    .map((id) => tabs.get(id))
+    .filter((t) => t && t.state === 'connected');
+  if (targets.length) {
+    for (const tab of targets) {
+      const pane = tab.panes.find((p) => p.id === tab.activePane) || tab.panes[0];
+      if (pane) window.api.input(tab.id, pane.id, c.cmd + '\r');
+    }
+    toast(`已同步执行到 ${targets.length} 台服务器：${c.name}`);
+    return;
+  }
   const tab = tabs.get(activeTabId);
   if (!tab || tab.state !== 'connected') {
     toast('请先连接服务器', true);
@@ -948,6 +1167,80 @@ function bindUI() {
   $('btnTermSettings').addEventListener('click', openTermDialog);
   $('btnTermCancel').addEventListener('click', () => $('termDialog').close());
   $('termForm').addEventListener('submit', saveTermForm);
+
+  // 跳板机开关
+  $('useJumpChk').addEventListener('change', () => {
+    $('rowJump').style.display = $('useJumpChk').checked ? '' : 'none';
+  });
+
+  // 端口转发
+  $('btnForward').addEventListener('click', openFwdDialog);
+  $('btnFwdClose').addEventListener('click', () => $('fwdDialog').close());
+  $('fwdForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const conn = currentConn();
+    if (!conn) return;
+    const FF = (n) => $('fwdForm').elements[n];
+    const localPort = Number(FF('localPort').value);
+    const dstHost = FF('dstHost').value.trim();
+    const dstPort = Number(FF('dstPort').value);
+    if (!localPort || !dstHost || !dstPort) { toast('请填写完整：本地端口 / 目标主机 / 目标端口', true); return; }
+    if (!Array.isArray(conn.forwards)) conn.forwards = [];
+    if (conn.forwards.some((r) => r.localPort === localPort)) {
+      toast('本地端口已存在', true);
+      return;
+    }
+    conn.forwards.push({
+      id: uid(), localPort, dstHost, dstPort,
+    });
+    await persist();
+    renderFwdList();
+    toast('规则已添加，点「启动」开始转发');
+    $('fwdForm').elements['localPort'].value = '';
+  });
+
+  // 连接配置导入 / 导出
+  $('btnExportConns').addEventListener('click', async () => {
+    if (!conns.length) { toast('还没有可导出的连接', true); return; }
+    const r = await window.api.exportConns(conns);
+    if (r.ok) toast('已导出到：' + r.path);
+  });
+  $('btnImportConns').addEventListener('click', async () => {
+    const r = await window.api.importConns();
+    if (!r.ok) {
+      if (r.error) toast('导入失败：' + r.error, true);
+      return;
+    }
+    conns = conns.concat(r.connections);
+    const updated = await window.api.saveConns({ connections: conns, groups: allGroupNames(), secrets: {} });
+    if (updated && updated.connections) conns = updated.connections;
+    renderConnList();
+    toast(`已导入 ${r.count} 个连接`);
+  });
+
+  // 终端搜索
+  $('btnSearchClose').addEventListener('click', closeSearch);
+  $('btnSearchNext').addEventListener('click', () => {
+    const s = activeSearch();
+    if (s) { try { s.findNext($('searchInput').value); } catch (_) {} }
+  });
+  $('btnSearchPrev').addEventListener('click', () => {
+    const s = activeSearch();
+    if (s) { try { s.findPrevious($('searchInput').value); } catch (_) {} }
+  });
+  $('searchInput').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      const s = activeSearch();
+      if (s) { try { (e.shiftKey ? s.findPrevious : s.findNext).call(s, $('searchInput').value); } catch (_) {} }
+    }
+    if (e.key === 'Escape') closeSearch();
+  });
+  document.addEventListener('keydown', (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f' && tabs.get(activeTabId)) {
+      e.preventDefault();
+      openSearch();
+    }
+  });
 
   $('searchBox').addEventListener('input', renderConnList);
 

@@ -20,6 +20,12 @@ contextBridge.exposeInMainWorld('api', {
   sftpUpload: (tabId, dirPath) => ipcRenderer.invoke('sftp:upload', { tabId, dirPath }),
   sftpDownload: (tabId, dirPath, entry) => ipcRenderer.invoke('sftp:download', { tabId, dirPath, entry }),
 
+  fwdStart: (tabId, rule) => ipcRenderer.send('fwd:start', { tabId, rule }),
+  fwdStop: (tabId, ruleId) => ipcRenderer.send('fwd:stop', { tabId, ruleId }),
+  exportConns: (connections) => ipcRenderer.invoke('conns:export', { connections }),
+  importConns: () => ipcRenderer.invoke('conns:import'),
+  saveText: (content, defaultName) => ipcRenderer.invoke('app:saveText', { content, defaultName }),
+
   onEvent: (cb) => {
     ipcRenderer.on('ssh-event', (e, evt) => cb(evt));
   },

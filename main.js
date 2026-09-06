@@ -7,6 +7,7 @@ const { SSHSession } = require('./ssh');
 
 let win = null;
 const sessions = new Map(); // tabId -> SSHSession
+const uid = () => 'c' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 
 // ---------- 本地连接数据持久化（AES 加密口令字段） ----------
 const SECRET = crypto.createHash('sha256').update('foxshell-local-v1').digest();
@@ -86,6 +87,7 @@ app.whenReady().then(() => {
       if (s) {
         if (s.password) c.passwordEnc = enc(s.password);
         if (s.passphrase) c.passphraseEnc = enc(s.passphrase);
+        if (s.jumpPassword) c.jumpPasswordEnc = enc(s.jumpPassword);
       }
     }
     saveConns({ connections: list, groups });
@@ -110,6 +112,10 @@ app.whenReady().then(() => {
         authType: conn.authType || 'password',
         password: dec(conn.passwordEnc),
         passphrase: dec(conn.passphraseEnc),
+        jumpHost: conn.useJump ? conn.jumpHost || '' : '',
+        jumpPort: conn.useJump ? conn.jumpPort || 22 : 22,
+        jumpUsername: conn.useJump ? conn.jumpUsername || conn.username || 'root' : '',
+        jumpPassword: conn.useJump ? dec(conn.jumpPasswordEnc) : '',
       };
       if (cfg.authType === 'key') {
         if (!conn.keyPath) throw new Error('未配置私钥文件');
@@ -144,6 +150,81 @@ app.whenReady().then(() => {
   ipcMain.on('ssh:close', (e, { tabId }) => {
     const s = sessions.get(tabId);
     if (s) { s.close('用户断开连接'); sessions.delete(tabId); }
+  });
+
+  // ---------- 端口转发 ----------
+  ipcMain.on('fwd:start', (e, { tabId, rule }) => {
+    const s = sessions.get(tabId);
+    if (s) s.startForward(rule);
+  });
+  ipcMain.on('fwd:stop', (e, { tabId, ruleId }) => {
+    const s = sessions.get(tabId);
+    if (s) s.stopForward(ruleId);
+  });
+
+  // ---------- 连接配置导入 / 导出 ----------
+  ipcMain.handle('conns:export', async (e, { connections }) => {
+    const r = await dialog.showSaveDialog(win, {
+      title: '导出连接配置',
+      defaultPath: 'foxshell-connections.json',
+      filters: [{ name: 'JSON', extensions: ['json'] }],
+    });
+    if (r.canceled || !r.filePath) return { ok: false };
+    const plain = connections.map((c) => ({
+      ...c,
+      password: dec(c.passwordEnc),
+      passphrase: dec(c.passphraseEnc),
+      jumpPassword: dec(c.jumpPasswordEnc),
+    }));
+    fs.writeFileSync(r.filePath, JSON.stringify({ type: 'foxshell-export', connections: plain }, null, 2), 'utf8');
+    return { ok: true, path: r.filePath };
+  });
+
+  ipcMain.handle('conns:import', async (e, { existingIds }) => {
+    const r = await dialog.showOpenDialog(win, {
+      title: '导入连接配置',
+      filters: [{ name: 'JSON', extensions: ['json'] }],
+      properties: ['openFile'],
+    });
+    if (r.canceled || !r.filePaths.length) return { ok: false };
+    let data;
+    try {
+      data = JSON.parse(fs.readFileSync(r.filePaths[0], 'utf8'));
+    } catch (err) {
+      return { ok: false, error: '文件不是有效的 JSON' };
+    }
+    const list = data.connections || data || [];
+    if (!Array.isArray(list)) return { ok: false, error: '文件格式不正确' };
+    const imported = list.filter((c) => c && c.host).map((c) => ({
+      id: uid(),
+      name: c.name || c.host,
+      host: c.host,
+      port: c.port || 22,
+      username: c.username || 'root',
+      group: c.group || '',
+      authType: c.authType === 'key' ? 'key' : 'password',
+      passwordEnc: enc(c.password),
+      keyPath: c.keyPath || '',
+      passphraseEnc: enc(c.passphrase),
+      useJump: !!c.useJump,
+      jumpHost: c.jumpHost || '',
+      jumpPort: c.jumpPort || 22,
+      jumpUsername: c.jumpUsername || '',
+      jumpPasswordEnc: enc(c.jumpPassword),
+      forwards: Array.isArray(c.forwards) ? c.forwards : [],
+    }));
+    return { ok: true, connections: imported, count: imported.length };
+  });
+
+  // ---------- 终端日志导出 ----------
+  ipcMain.handle('app:saveText', async (e, { content, defaultName }) => {
+    const r = await dialog.showSaveDialog(win, {
+      title: '导出终端日志',
+      defaultPath: defaultName || 'terminal.log',
+    });
+    if (r.canceled || !r.filePath) return { ok: false };
+    fs.writeFileSync(r.filePath, content, 'utf8');
+    return { ok: true, path: r.filePath };
   });
 
   // ---------- SFTP ----------

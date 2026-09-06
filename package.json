@@ -8,23 +8,48 @@
     "pack": "electron-builder --dir",
     "dist": "electron-builder"
   },
-  "keywords": ["ssh", "terminal", "sftp", "finalshell"],
+  "keywords": [
+    "ssh",
+    "terminal",
+    "sftp",
+    "finalshell"
+  ],
   "author": "Andersen",
   "license": "MIT",
   "devDependencies": {
-    "electron": "^44.2.0"
+    "electron": "^44.2.0",
+    "electron-builder": "^26.15.3"
   },
   "dependencies": {
     "@xterm/addon-fit": "^0.11.0",
+    "@xterm/addon-search": "^0.16.0",
     "@xterm/xterm": "^6.0.0",
     "ssh2": "^1.17.0"
   },
   "build": {
     "appId": "com.andersen.foxshell",
     "productName": "FoxShell",
-    "directories": { "output": "dist" },
-    "files": ["main.js", "ssh.js", "preload.js", "renderer/**/*", "node_modules/**/*", "package.json"],
-    "win": { "target": ["nsis", "portable"] },
-    "nsis": { "oneClick": false, "allowToChangeInstallationDirectory": true }
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "ssh.js",
+      "preload.js",
+      "renderer/**/*",
+      "node_modules/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ],
+      "icon": "renderer/icon.png"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
   }
 }

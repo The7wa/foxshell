@@ -14,8 +14,10 @@ class SSHSession extends EventEmitter {
     this.tabId = tabId;
     this.send = send; // (type, payload) => webContents.send('ssh-event', {tabId, type, payload})
     this.client = null;
+    this.jumpClient = null;
     this.sftp = null;
     this.shells = new Map(); // paneId -> shell stream（一个连接可开多个终端，供分屏使用）
+    this.forwards = new Map(); // 转发规则 id -> net.Server
     this.statsTimer = null;
     this.prev = null; // 上一帧 cpu/net 采样
     this.prevNet = null;
@@ -27,7 +29,18 @@ class SSHSession extends EventEmitter {
     this.send(type, payload);
   }
 
-  connect(cfg) {
+  // 用一个 Client 发起连接（支持 keyboard-interactive），Promise 化
+  dial(c, opts, password) {
+    return new Promise((resolve, reject) => {
+      const onError = (err) => reject(err);
+      c.on('keyboard-interactive', (name, instr, lang, prompts, finish) => finish([password || '']));
+      c.once('ready', () => { c.removeListener('error', onError); resolve(); });
+      c.once('error', onError);
+      c.connect(opts);
+    });
+  }
+
+  async connect(cfg) {
     this.cfg = cfg;
     const c = new Client();
     this.client = c;
@@ -47,29 +60,81 @@ class SSHSession extends EventEmitter {
       opts.password = cfg.password;
     }
 
-    c.on('keyboard-interactive', (name, instr, lang, prompts, finish) => {
-      finish([cfg.password || '']);
-    });
-
-    c.on('ready', () => {
-      this.emit_('status', { state: 'connected' });
-      c.sftp((err, sftp) => {
-        if (err) return;
-        this.sftp = sftp;
-        this.emit_('sftp-ready', {});
-        this.startStats(cfg);
-      });
-    });
-
-    c.on('error', (err) => {
+    try {
+      // 跳板机：先连跳板机，再通过 forwardOut 通道连目标（支持一层跳板）
+      if (cfg.jumpHost) {
+        this.emit_('status', { state: 'connecting', message: `正在连接跳板机 ${cfg.jumpHost}...` });
+        const jump = new Client();
+        this.jumpClient = jump;
+        await this.dial(jump, {
+          host: cfg.jumpHost,
+          port: cfg.jumpPort || 22,
+          username: cfg.jumpUsername || cfg.username,
+          readyTimeout: 15000,
+          keepaliveInterval: 10000,
+          tryKeyboard: true,
+        }, cfg.jumpPassword);
+        this.emit_('status', { state: 'connecting', message: '跳板机已连接，正在连接目标服务器...' });
+        const stream = await new Promise((resolve, reject) => {
+          jump.forwardOut('127.0.0.1', 0, cfg.host, cfg.port || 22, (err, s) => (err ? reject(err) : resolve(s)));
+        });
+        opts.sock = stream;
+      }
+      await this.dial(c, opts, cfg.password);
+    } catch (err) {
       if (!this.closed) this.emit_('status', { state: 'failed', message: String(err.message || err) });
-    });
+      return;
+    }
+
+    this.emit_('status', { state: 'connected' });
+    // 连接建立后的断线检测
     c.on('close', () => {
       if (!this.closed) this.close('连接已断开');
     });
+    c.on('error', (err) => {
+      if (!this.closed) this.emit_('status', { state: 'failed', message: String(err.message || err) });
+    });
+    c.sftp((err, sftp) => {
+      if (err) return;
+      this.sftp = sftp;
+      this.emit_('sftp-ready', {});
+      this.startStats(cfg);
+    });
+  }
 
-    this.emit_('status', { state: 'connecting' });
-    c.connect(opts);
+  // ---------- 端口转发（ssh -L 本地转发） ----------
+  startForward(rule) {
+    if (this.forwards.has(rule.id)) return;
+    const net = require('net');
+    const server = net.createServer((sock) => {
+      if (!this.client || this.closed) return sock.destroy();
+      this.client.forwardOut('127.0.0.1', sock.remotePort || 0, rule.dstHost, rule.dstPort, (err, stream) => {
+        if (err) {
+          sock.destroy();
+          return this.emit_('forward-error', { id: rule.id, message: String(err.message || err) });
+        }
+        sock.pipe(stream).pipe(sock);
+        stream.on('error', () => sock.destroy());
+      });
+      sock.on('error', () => {});
+    });
+    server.on('error', (err) => {
+      this.forwards.delete(rule.id);
+      this.emit_('forward-error', { id: rule.id, message: String(err.message || err) });
+    });
+    server.listen(rule.localPort, '127.0.0.1', () => {
+      this.forwards.set(rule.id, server);
+      this.emit_('forward-state', { id: rule.id, active: true, localPort: rule.localPort });
+    });
+  }
+
+  stopForward(ruleId) {
+    const server = this.forwards.get(ruleId);
+    if (server) {
+      try { server.close(); } catch (_) {}
+      this.forwards.delete(ruleId);
+    }
+    this.emit_('forward-state', { id: ruleId, active: false });
   }
 
   // 在当前连接上打开一个新的交互终端（paneId 由渲染进程分配）
@@ -346,12 +411,17 @@ class SSHSession extends EventEmitter {
     if (this.closed) return;
     this.closed = true;
     if (this.statsTimer) clearInterval(this.statsTimer);
+    for (const server of this.forwards.values()) {
+      try { server.close(); } catch (_) {}
+    }
+    this.forwards.clear();
     for (const s of this.shells.values()) {
       try { s.end(); } catch (_) {}
     }
     this.shells.clear();
     try { this.sftp && this.sftp.end(); } catch (_) {}
     try { this.client && this.client.end(); } catch (_) {}
+    try { this.jumpClient && this.jumpClient.end(); } catch (_) {}
     this.emit_('status', { state: 'closed', message: reason || '' });
   }
 }
