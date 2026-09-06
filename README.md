@@ -1,4 +1,4 @@
-# FoxShell — 仿 FinalShell 的 SSH 客户端
+# FoxShell  SSH 客户端
 
 基于 Electron + xterm.js + ssh2 的 SSH 连接管理工具，包含 FinalShell 核心功能：
 
