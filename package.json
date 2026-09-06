@@ -1,7 +1,7 @@
 {
   "name": "foxshell",
   "version": "1.0.0",
-  "description": "仿 FinalShell 的 SSH 连接管理客户端（终端 + SFTP + 资源监控）",
+  "description": "FoxShell - SSH 连接管理客户端",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
@@ -11,8 +11,7 @@
   "keywords": [
     "ssh",
     "terminal",
-    "sftp",
-    "finalshell"
+    "sftp"
   ],
   "author": "Andersen",
   "license": "MIT",
