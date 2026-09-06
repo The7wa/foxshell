@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self' data:; img-src 'self' data:;" />
+  <title>FoxShell - SSH 终端</title>
+  <link rel="stylesheet" href="styles.css" />
+  <link rel="stylesheet" href="../node_modules/@xterm/xterm/css/xterm.css" />
+</head>
+<body>
+  <div id="app">
+    <!-- 左栏：连接管理器 -->
+    <aside id="sidebar">
+      <div class="side-header">
+        <span class="logo">🦊 FoxShell</span>
+      </div>
+      <div class="side-search">
+        <input id="searchBox" type="text" placeholder="搜索主机..." />
+      </div>
+      <div id="connList" class="conn-list"></div>
+      <div class="side-footer">
+        <button id="btnAddConn" class="btn btn-primary btn-block">＋ 新建连接</button>
+      </div>
+    </aside>
+
+    <!-- 中/右主区域 -->
+    <div id="main">
+      <!-- 标签栏 -->
+      <div id="tabbar">
+        <div id="tabs"></div>
+        <div class="tabbar-actions">
+          <button id="btnToggleSftp" class="icon-btn" title="文件管理 (SFTP)">📂 文件</button>
+          <button id="btnDisconnect" class="icon-btn" title="断开当前连接">⏻ 断开</button>
+        </div>
+      </div>
+
+      <div id="content">
+        <!-- 中间：终端 + 监控 -->
+        <div id="center">
+          <div id="welcome">
+            <div class="welcome-logo">🦊</div>
+            <h2>FoxShell</h2>
+            <p>双击左侧主机建立 SSH 连接</p>
+            <p class="dim">支持密码 / 密钥登录 · SFTP 文件管理 · 服务器资源监控</p>
+          </div>
+          <div id="termStack"></div>
+          <div id="monitor">
+            <span id="monStatus">未连接</span>
+            <div class="mon-item" id="monCpu" title="CPU 使用率">
+              <span class="mon-label">CPU</span>
+              <div class="bar"><div class="bar-fill"></div></div>
+              <span class="mon-val">--</span>
+            </div>
+            <div class="mon-item" id="monMem" title="内存使用率">
+              <span class="mon-label">内存</span>
+              <div class="bar"><div class="bar-fill"></div></div>
+              <span class="mon-val">--</span>
+            </div>
+            <div class="mon-item plain" title="下行 / 上行速率">
+              <span class="mon-label">网络</span>
+              <span class="mon-val" id="monNet">↓ -- ↑ --</span>
+            </div>
+            <div class="mon-item plain" title="根分区磁盘使用率">
+              <span class="mon-label">磁盘</span>
+              <span class="mon-val" id="monDisk">--</span>
+            </div>
+            <div class="mon-item plain" title="1 分钟平均负载">
+              <span class="mon-label">负载</span>
+              <span class="mon-val" id="monLoad">--</span>
+            </div>
+            <div class="mon-item plain" title="运行时长">
+              <span class="mon-label">运行</span>
+              <span class="mon-val" id="monUptime">--</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- 右侧：SFTP 文件管理 -->
+        <div id="sftpPanel" class="hidden">
+          <div class="sftp-toolbar">
+            <button id="btnSftpUp" class="icon-btn" title="上一级">⬆</button>
+            <input id="sftpPath" type="text" spellcheck="false" placeholder="远程路径" />
+            <button id="btnSftpGo" class="icon-btn" title="跳转">→</button>
+            <button id="btnSftpRefresh" class="icon-btn" title="刷新">⟳</button>
+          </div>
+          <div class="sftp-actions">
+            <button id="btnSftpMkdir" class="mini-btn">＋文件夹</button>
+            <button id="btnSftpUpload" class="mini-btn">⬆ 上传</button>
+            <button id="btnSftpDelete" class="mini-btn">🗑 删除</button>
+            <button id="btnSftpRename" class="mini-btn">✏ 重命名</button>
+          </div>
+          <div id="sftpHeadRow" class="sftp-row head">
+            <span class="sftp-name">名称</span>
+            <span class="sftp-size">大小</span>
+            <span class="sftp-time">修改时间</span>
+          </div>
+          <div id="sftpList"></div>
+          <div id="transferBar" class="hidden">
+            <span id="transferLabel"></span>
+            <div class="bar"><div id="transferFill" class="bar-fill"></div></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 新建/编辑连接 -->
+  <dialog id="connDialog">
+    <form id="connForm" method="dialog">
+      <h3 id="connDialogTitle">新建连接</h3>
+      <label>名称 <input name="name" type="text" placeholder="我的服务器（留空则用主机名）" /></label>
+      <div class="row2">
+        <label>主机地址 <input name="host" type="text" placeholder="192.168.1.100" required /></label>
+        <label>端口 <input name="port" type="number" value="22" min="1" max="65535" /></label>
+      </div>
+      <div class="row2">
+        <label>用户名 <input name="username" type="text" value="root" required /></label>
+        <label>分组 <input name="group" type="text" placeholder="可选" /></label>
+      </div>
+      <label>认证方式
+        <select name="authType" id="authTypeSel">
+          <option value="password">密码登录</option>
+          <option value="key">私钥登录</option>
+        </select>
+      </label>
+      <label id="rowPassword">密码 <input name="password" type="password" placeholder="留空则保持原密码" /></label>
+      <div id="rowKey">
+        <label>私钥文件
+          <div class="keyfile">
+            <input id="keyPathText" type="text" readonly placeholder="未选择" />
+            <button type="button" id="btnPickKey" class="mini-btn">选择...</button>
+          </div>
+        </label>
+        <label>私钥口令 <input name="passphrase" type="password" placeholder="无则留空" /></label>
+      </div>
+      <div class="dialog-actions">
+        <button type="button" id="btnConnCancel" class="btn">取消</button>
+        <button type="submit" id="btnConnSave" class="btn btn-primary">保存</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- 通用输入框（新建文件夹/重命名） -->
+  <dialog id="promptDialog">
+    <form id="promptForm" method="dialog">
+      <h3 id="promptTitle">输入</h3>
+      <input id="promptInput" type="text" spellcheck="false" />
+      <div class="dialog-actions">
+        <button type="button" id="btnPromptCancel" class="btn">取消</button>
+        <button type="submit" class="btn btn-primary">确定</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="../node_modules/@xterm/xterm/lib/xterm.js"></script>
+  <script src="../node_modules/@xterm/addon-fit/lib/addon-fit.js"></script>
+  <script src="renderer.js"></script>
+</body>
+</html>

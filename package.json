@@ -1,0 +1,30 @@
+{
+  "name": "foxshell",
+  "version": "1.0.0",
+  "description": "仿 FinalShell 的 SSH 连接管理客户端（终端 + SFTP + 资源监控）",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder"
+  },
+  "keywords": ["ssh", "terminal", "sftp", "finalshell"],
+  "author": "Andersen",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^44.2.0"
+  },
+  "dependencies": {
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
+    "ssh2": "^1.17.0"
+  },
+  "build": {
+    "appId": "com.andersen.foxshell",
+    "productName": "FoxShell",
+    "directories": { "output": "dist" },
+    "files": ["main.js", "ssh.js", "preload.js", "renderer/**/*", "node_modules/**/*", "package.json"],
+    "win": { "target": ["nsis", "portable"] },
+    "nsis": { "oneClick": false, "allowToChangeInstallationDirectory": true }
+  }
+}
