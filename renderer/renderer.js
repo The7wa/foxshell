@@ -17,9 +17,18 @@ const store = {
   set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (_) {} },
 };
 
-// 折叠的分组、空的分组、快捷命令都存 localStorage
+// 折叠的分组、空的分组、快捷命令、终端外观都存 localStorage
 let collapsedGroups = store.get('foxshell.collapsed', []);
 let extraGroups = store.get('foxshell.groups', []);
+
+let termCfg = Object.assign({
+  bg: '#101418',
+  fg: '#d6dce2',
+  font: 'Consolas, "Courier New", monospace',
+  size: 13,
+  cursor: 'block',
+  blink: true,
+}, store.get('foxshell.termCfg', {}));
 
 const DEFAULT_CMDS = [
   { name: '磁盘占用', cmd: 'df -h' },
@@ -82,6 +91,16 @@ function toast(msg, bad) {
 function allGroupNames() {
   return [...new Set([...extraGroups, ...conns.map((c) => c.group || '')])].filter((g) => g !== '');
 }
+function xtermTheme() {
+  return {
+    background: termCfg.bg,
+    foreground: termCfg.fg,
+    cursor: '#3d9a50',
+    selectionBackground: '#2f81f766',
+    black: '#101418', red: '#e5534b', green: '#57ab5a', yellow: '#c69026',
+    blue: '#539bf5', magenta: '#b083f0', cyan: '#39c5cf', white: '#d6dce2',
+  };
+}
 
 // ---------------- 初始化 ----------------
 async function init() {
@@ -121,7 +140,6 @@ function renderConnList() {
     return;
   }
 
-  // 分组：命名分组在前（按名称），未分组最后
   const gmap = new Map();
   for (const g of allGroupNames().sort((a, b) => a.localeCompare(b))) gmap.set(g, []);
   for (const c of shown) {
@@ -132,11 +150,11 @@ function renderConnList() {
   if (gmap.has('')) {
     const un = gmap.get('');
     gmap.delete('');
-    gmap.set('', un); // 未分组放最后
+    gmap.set('', un);
   }
 
   for (const [g, items] of gmap) {
-    if (g === '' && !items.length) continue; // 空的未分组不显示
+    if (g === '' && !items.length) continue;
     list.appendChild(groupHeaderEl(g, items.length));
     if (!collapsedGroups.includes(g)) {
       for (const c of items) list.appendChild(connItemEl(c));
@@ -163,7 +181,6 @@ function groupHeaderEl(g, count) {
     store.set('foxshell.collapsed', collapsedGroups);
     renderConnList();
   });
-  // 拖拽归组
   el.addEventListener('dragover', (e) => { e.preventDefault(); el.classList.add('dragover'); });
   el.addEventListener('dragleave', () => el.classList.remove('dragover'));
   el.addEventListener('drop', async (e) => {
@@ -310,7 +327,7 @@ async function saveConnForm(e) {
   }
 }
 
-// ---------------- 标签页 / 终端 ----------------
+// ---------------- 标签页 / 终端（支持分屏多面板） ----------------
 function connectConn(conn) {
   const existing = [...tabs.values()].find((t) => t.connId === conn.id && t.state !== 'closed');
   if (existing) return activateTab(existing.id);
@@ -321,28 +338,11 @@ function createTab(conn) {
   const id = uid();
   const wrap = document.createElement('div');
   wrap.className = 'term-wrap hidden';
+  wrap.style.background = termCfg.bg;
+  const layout = document.createElement('div');
+  layout.className = 'term-layout';
+  wrap.appendChild(layout);
   $('termStack').appendChild(wrap);
-
-  const term = new Terminal({
-    fontSize: store.get('foxshell.font', 13),
-    fontFamily: 'Consolas, "Courier New", monospace',
-    cursorBlink: true,
-    scrollback: 5000,
-    theme: {
-      background: '#101418',
-      foreground: '#d6dce2',
-      cursor: '#3d9a50',
-      selectionBackground: '#2f81f766',
-      black: '#101418', red: '#e5534b', green: '#57ab5a', yellow: '#c69026',
-      blue: '#539bf5', magenta: '#b083f0', cyan: '#39c5cf', white: '#d6dce2',
-    },
-  });
-  const fit = new FitAddon.FitAddon();
-  term.loadAddon(fit);
-  term.open(wrap);
-  term.onData((d) => window.api.input(id, d));
-  term.onResize(({ cols, rows }) => window.api.resize(id, cols, rows));
-  term.writeln(`正在连接 ${conn.username}@${conn.host}:${conn.port} ...`);
 
   const tab = {
     id,
@@ -350,16 +350,154 @@ function createTab(conn) {
     conn,
     title: conn.name || conn.host,
     state: 'connecting',
-    term,
     wrap,
-    fit,
+    layout,
+    direction: 'row',
+    panes: [],
+    activePane: null,
     stats: null,
     sftp: { started: false, cwd: null, entries: [], selected: null },
   };
   tabs.set(id, tab);
   renderTabs();
   activateTab(id);
+  addPane(tab, -1); // 第一个终端面板
   window.api.connect(id, conn);
+}
+
+function termOptions() {
+  return {
+    fontSize: termCfg.size,
+    fontFamily: termCfg.font,
+    cursorBlink: termCfg.blink,
+    cursorStyle: termCfg.cursor,
+    scrollback: 5000,
+    theme: xtermTheme(),
+  };
+}
+
+function addPane(tab, index, direction) {
+  const paneId = uid();
+  if (direction && direction !== tab.direction) {
+    tab.direction = direction;
+    tab.layout.style.flexDirection = direction === 'row' ? 'row' : 'column';
+  }
+  const el = document.createElement('div');
+  el.className = 'term-pane';
+  el.style.background = termCfg.bg;
+  el.innerHTML = `
+    <div class="pane-tools">
+      <button data-a="splitH" title="复制终端（左右分屏，同一连接新开终端）">⧉ 复制</button>
+      <button data-a="splitV" title="上下分屏">⬓ 上下</button>
+      <button data-a="close" class="pclose" title="关闭此终端">✕</button>
+    </div>`;
+
+  const term = new Terminal(termOptions());
+  const fit = new FitAddon.FitAddon();
+  term.loadAddon(fit);
+  // xterm 需要挂载到独立内容层，避免与悬浮工具栏互相干扰
+  const inner = document.createElement('div');
+  inner.style.cssText = 'position:absolute;inset:4px 0 0 8px;';
+  el.appendChild(inner);
+  term.open(inner);
+
+  const pane = { id: paneId, el, inner, term, fit };
+  const at = index < 0 || index > tab.panes.length ? tab.panes.length : index;
+  tab.panes.splice(at, 0, pane);
+
+  // 插入 DOM（按顺序重建 splitter）
+  relayoutPanes(tab);
+
+  term.onData((d) => window.api.input(tab.id, paneId, d));
+  el.addEventListener('click', () => setActivePane(tab, pane));
+  el.querySelector('[data-a=splitH]').addEventListener('click', (e) => {
+    e.stopPropagation();
+    addPane(tab, tab.panes.indexOf(pane) + 1, 'row');
+  });
+  el.querySelector('[data-a=splitV]').addEventListener('click', (e) => {
+    e.stopPropagation();
+    addPane(tab, tab.panes.indexOf(pane) + 1, 'column');
+  });
+  el.querySelector('[data-a=close]').addEventListener('click', (e) => {
+    e.stopPropagation();
+    closePane(tab, pane);
+  });
+
+  setActivePane(tab, pane);
+  if (tab.state === 'connected') window.api.openPane(tab.id, paneId);
+  fitAllPanes(tab);
+  return pane;
+}
+
+// 依据 panes 顺序与方向重建布局（splitter 夹在相邻面板之间）
+function relayoutPanes(tab) {
+  tab.layout.style.flexDirection = tab.direction === 'row' ? 'row' : 'column';
+  for (const el of [...tab.layout.querySelectorAll('.pane-splitter-h, .pane-splitter-v')]) el.remove();
+  tab.panes.forEach((p, i) => {
+    tab.layout.appendChild(p.el);
+    if (i < tab.panes.length - 1) {
+      const sp = document.createElement('div');
+      sp.className = tab.direction === 'row' ? 'pane-splitter-h' : 'pane-splitter-v';
+      makePaneResizable(tab, sp, p, tab.panes[i + 1]);
+      tab.layout.appendChild(sp);
+    }
+  });
+}
+
+// 拖动 splitter 调整相邻两个面板的 flex-grow
+function makePaneResizable(tab, sp, p1, p2) {
+  const isRow = () => tab.direction === 'row';
+  sp.addEventListener('mousedown', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const sizeKey = isRow() ? 'clientWidth' : 'clientHeight';
+    const start = isRow() ? e.clientX : e.clientY;
+    const g1 = parseFloat(p1.el.style.flexGrow) || 1;
+    const g2 = parseFloat(p2.el.style.flexGrow) || 1;
+    const container = tab.layout[sizeKey];
+    const perPx = (g1 + g2) / Math.max(1, container);
+    const onMove = (ev) => {
+      const d = (isRow() ? ev.clientX : ev.clientY) - start;
+      const n1 = Math.max(0.15, g1 + d * perPx);
+      const n2 = Math.max(0.15, g1 + g2 - n1);
+      p1.el.style.flexGrow = n1;
+      p2.el.style.flexGrow = n2;
+      fitAllPanes(tab);
+    };
+    const onUp = () => {
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+    };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+    document.body.style.cursor = isRow() ? 'col-resize' : 'row-resize';
+    document.body.style.userSelect = 'none';
+  });
+}
+
+function setActivePane(tab, pane) {
+  tab.activePane = pane.id;
+  for (const p of tab.panes) p.el.classList.toggle('active', p.id === pane.id);
+  try { pane.term.focus(); } catch (_) {}
+}
+
+function fitAllPanes(tab) {
+  if (!tab || tab.wrap.classList.contains('hidden')) return;
+  for (const p of tab.panes) {
+    try { p.fit.fit(); } catch (_) {}
+  }
+}
+
+function closePane(tab, pane) {
+  window.api.closePane(tab.id, pane.id);
+  try { pane.term.dispose(); } catch (_) {}
+  tab.panes = tab.panes.filter((p) => p !== pane);
+  if (!tab.panes.length) return closeTab(tab.id);
+  relayoutPanes(tab);
+  if (tab.activePane === pane.id) setActivePane(tab, tab.panes[0]);
+  fitAllPanes(tab);
 }
 
 function activateTab(id) {
@@ -368,7 +506,11 @@ function activateTab(id) {
   renderTabs();
   const tab = tabs.get(id);
   if (tab) {
-    try { tab.fit.fit(); tab.term.focus(); } catch (_) {}
+    fitAllPanes(tab);
+    if (tab.activePane) {
+      const p = tab.panes.find((x) => x.id === tab.activePane);
+      if (p) try { p.term.focus(); } catch (_) {}
+    }
   }
   renderMonitor();
   refreshSftpPanel();
@@ -379,7 +521,9 @@ function closeTab(id) {
   const tab = tabs.get(id);
   if (!tab) return;
   window.api.close(id);
-  tab.term.dispose();
+  for (const p of tab.panes) {
+    try { p.term.dispose(); } catch (_) {}
+  }
   tab.wrap.remove();
   tabs.delete(id);
   if (activeTabId === id) {
@@ -434,7 +578,7 @@ function disconnectOrReconnect() {
     connectConn(conn);
   } else {
     window.api.close(tab.id);
-    tab.term.writeln('\r\n\x1b[33m--- 已手动断开，点击右上角「重连」重新连接 ---\x1b[0m');
+    for (const p of tab.panes) p.term.writeln('\r\n\x1b[33m--- 已手动断开，点击右上角「重连」重新连接 ---\x1b[0m');
     tab.state = 'closed';
     renderTabs();
     renderMonitor();
@@ -442,22 +586,80 @@ function disconnectOrReconnect() {
   }
 }
 
+// ---------------- 终端外观设置 ----------------
+function applyTermCfg() {
+  for (const tab of tabs.values()) {
+    tab.wrap.style.background = termCfg.bg;
+    for (const p of tab.panes) {
+      p.el.style.background = termCfg.bg;
+      p.term.options.theme = xtermTheme();
+      p.term.options.fontFamily = termCfg.font;
+      p.term.options.fontSize = termCfg.size;
+      p.term.options.cursorStyle = termCfg.cursor;
+      p.term.options.cursorBlink = termCfg.blink;
+    }
+    fitAllPanes(tab);
+  }
+  store.set('foxshell.termCfg', termCfg);
+}
+
+function openTermDialog() {
+  const f = $('termForm');
+  const F = (n) => f.elements[n];
+  F('bg').value = termCfg.bg;
+  F('fg').value = termCfg.fg;
+  F('font').value = termCfg.font;
+  F('size').value = termCfg.size;
+  F('cursor').value = termCfg.cursor;
+  F('blink').checked = termCfg.blink;
+  $('termDialog').showModal();
+}
+
+function saveTermForm(e) {
+  e.preventDefault();
+  const f = $('termForm');
+  const F = (n) => f.elements[n];
+  termCfg = {
+    bg: F('bg').value,
+    fg: F('fg').value,
+    font: F('font').value,
+    size: Math.max(8, Math.min(28, Number(F('size').value) || 13)),
+    cursor: F('cursor').value,
+    blink: F('blink').checked,
+  };
+  applyTermCfg();
+  $('termDialog').close();
+  toast('终端外观已更新');
+}
+
 // ---------------- 主进程事件 ----------------
 function handleEvent(evt) {
   const tab = tabs.get(evt.tabId);
   if (!tab) return;
   const { type, payload } = evt;
-  if (type === 'data') {
-    tab.term.write(b64ToBytes(payload));
+  if (type === 'pane-data') {
+    const pane = tab.panes.find((p) => p.id === payload.paneId);
+    if (pane) pane.term.write(b64ToBytes(payload.data));
+  } else if (type === 'pane-ready') {
+    const pane = tab.panes.find((p) => p.id === payload.paneId);
+    if (pane && tab.panes.length === 1) pane.term.writeln('\x1b[32m连接成功。\x1b[0m');
+    if (pane && tab.state !== 'connected') { /* 分屏新终端不额外提示 */ }
+  } else if (type === 'pane-error') {
+    const pane = tab.panes.find((p) => p.id === payload.paneId);
+    if (pane) pane.term.writeln(`\x1b[31m打开终端失败：${payload.message}\x1b[0m`);
+  } else if (type === 'pane-closed') {
+    // 远端 shell 关闭（如连接断开）；面板由 status=closed 统一处理
   } else if (type === 'status') {
     tab.state = payload.state;
     if (payload.state === 'connected') {
-      tab.term.writeln('\x1b[32m连接成功。\x1b[0m');
-      if (tab.id === activeTabId) { try { tab.fit.fit(); tab.term.focus(); } catch (_) {} }
+      if (!tab.panes.length) addPane(tab, -1);
+      else window.api.openPane(tab.id, tab.panes[0].id);
+      fitAllPanes(tab);
     } else if (payload.state === 'failed') {
-      tab.term.writeln(`\r\n\x1b[31m连接失败：${payload.message || '未知错误'}\x1b[0m`);
+      const p = tab.panes[0];
+      if (p) p.term.writeln(`\r\n\x1b[31m连接失败：${payload.message || '未知错误'}\x1b[0m`);
     } else if (payload.state === 'closed' && payload.message) {
-      tab.term.writeln(`\r\n\x1b[33m${payload.message}\x1b[0m`);
+      for (const p of tab.panes) p.term.writeln(`\r\n\x1b[33m${payload.message}\x1b[0m`);
     }
     renderTabs();
     renderConnList();
@@ -629,9 +831,11 @@ function runCommand(c) {
     toast('请先连接服务器', true);
     return;
   }
-  window.api.input(tab.id, c.cmd + '\r');
+  const pane = tab.panes.find((p) => p.id === tab.activePane) || tab.panes[0];
+  if (!pane) { toast('没有终端面板', true); return; }
+  window.api.input(tab.id, pane.id, c.cmd + '\r');
   toast(`已执行：${c.name}`);
-  tab.term.focus();
+  try { pane.term.focus(); } catch (_) {}
 }
 
 // ---------------- SFTP 面板 ----------------
@@ -721,6 +925,30 @@ function bindUI() {
     promptCb = null;
   });
 
+  // 添加命令（居中对话框：第一栏名称，第二栏命令）
+  $('btnCmdAdd').addEventListener('click', () => {
+    $('cmdForm').elements['cmdName'].value = '';
+    $('cmdForm').elements['cmdText'].value = '';
+    $('cmdDialog').showModal();
+  });
+  $('btnCmdCancel').addEventListener('click', () => $('cmdDialog').close());
+  $('cmdForm').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const name = $('cmdForm').elements['cmdName'].value.trim();
+    const cmd = $('cmdForm').elements['cmdText'].value.trim();
+    if (!name || !cmd) return;
+    cmdList.push({ name, cmd });
+    store.set('foxshell.cmds', cmdList);
+    renderCmdList();
+    $('cmdDialog').close();
+    toast('命令已添加');
+  });
+
+  // 终端外观设置
+  $('btnTermSettings').addEventListener('click', openTermDialog);
+  $('btnTermCancel').addEventListener('click', () => $('termDialog').close());
+  $('termForm').addEventListener('submit', saveTermForm);
+
   $('searchBox').addEventListener('input', renderConnList);
 
   $('btnDisconnect').addEventListener('click', disconnectOrReconnect);
@@ -736,9 +964,7 @@ function bindUI() {
   // 终端自适应
   const ro = new ResizeObserver(() => {
     const tab = tabs.get(activeTabId);
-    if (tab && tab.wrap && !tab.wrap.classList.contains('hidden')) {
-      try { tab.fit.fit(); } catch (_) {}
-    }
+    if (tab) fitAllPanes(tab);
   });
   ro.observe($('termStack'));
 
@@ -746,13 +972,9 @@ function bindUI() {
   $('termStack').addEventListener('wheel', (e) => {
     if (!e.ctrlKey) return;
     e.preventDefault();
-    const tab = tabs.get(activeTabId);
-    if (!tab) return;
-    const cur = tab.term.options.fontSize;
-    const n = Math.max(8, Math.min(28, cur + (e.deltaY < 0 ? 1 : -1)));
-    for (const t of tabs.values()) t.term.options.fontSize = n;
-    store.set('foxshell.font', n);
-    try { tab.fit.fit(); } catch (_) {}
+    if (!tabs.get(activeTabId)) return;
+    termCfg.size = Math.max(8, Math.min(28, termCfg.size + (e.deltaY < 0 ? 1 : -1)));
+    applyTermCfg();
   }, { passive: false });
 
   // SFTP 工具栏
@@ -797,19 +1019,6 @@ function bindUI() {
     if (!ent) { toast('请先选中文件或文件夹', true); return; }
     askText('重命名', ent.name, (name) => {
       if (name && name !== ent.name) window.api.sftpRename(tab.id, tab.sftp.cwd, ent.name, name);
-    });
-  });
-
-  // 快捷命令
-  $('btnCmdAdd').addEventListener('click', () => {
-    askText('命令名称（如：查看磁盘）', '', (name) => {
-      if (!name) return;
-      askText('要执行的命令', '', (cmd) => {
-        if (!cmd) return;
-        cmdList.push({ name, cmd });
-        store.set('foxshell.cmds', cmdList);
-        renderCmdList();
-      });
     });
   });
 }

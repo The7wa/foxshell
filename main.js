@@ -100,7 +100,7 @@ app.whenReady().then(() => {
     return r.canceled ? null : r.filePaths[0];
   });
 
-  // ---------- SSH 终端 ----------
+  // ---------- SSH 终端（一个连接可开多个终端面板） ----------
   ipcMain.handle('ssh:connect', async (e, { tabId, conn }) => {
     try {
       const cfg = {
@@ -125,13 +125,21 @@ app.whenReady().then(() => {
     }
   });
 
-  ipcMain.on('ssh:input', (e, { tabId, data }) => {
+  ipcMain.on('ssh:openPane', (e, { tabId, paneId }) => {
     const s = sessions.get(tabId);
-    if (s) s.write(data);
+    if (s) s.openShell(paneId);
   });
-  ipcMain.on('ssh:resize', (e, { tabId, cols, rows }) => {
+  ipcMain.on('ssh:input', (e, { tabId, paneId, data }) => {
     const s = sessions.get(tabId);
-    if (s) s.resize(cols, rows);
+    if (s) s.write(paneId, data);
+  });
+  ipcMain.on('ssh:resize', (e, { tabId, paneId, cols, rows }) => {
+    const s = sessions.get(tabId);
+    if (s) s.resize(paneId, cols, rows);
+  });
+  ipcMain.on('ssh:closePane', (e, { tabId, paneId }) => {
+    const s = sessions.get(tabId);
+    if (s) s.closePane(paneId);
   });
   ipcMain.on('ssh:close', (e, { tabId }) => {
     const s = sessions.get(tabId);

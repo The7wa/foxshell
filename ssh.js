@@ -8,11 +8,6 @@ const RAW_STATS_CMD =
 
 const STATS_INTERVAL = 2000;
 
-// 把路径安全地包进单引号，用于远端 shell
-function q(s) {
-  return "'" + String(s).replace(/'/g, "'\\''") + "'";
-}
-
 class SSHSession extends EventEmitter {
   constructor(tabId, send) {
     super();
@@ -20,9 +15,11 @@ class SSHSession extends EventEmitter {
     this.send = send; // (type, payload) => webContents.send('ssh-event', {tabId, type, payload})
     this.client = null;
     this.sftp = null;
-    this.stream = null;
+    this.shells = new Map(); // paneId -> shell stream（一个连接可开多个终端，供分屏使用）
     this.statsTimer = null;
     this.prev = null; // 上一帧 cpu/net 采样
+    this.prevNet = null;
+    this.cfg = null;
     this.closed = false;
   }
 
@@ -31,11 +28,12 @@ class SSHSession extends EventEmitter {
   }
 
   connect(cfg) {
+    this.cfg = cfg;
     const c = new Client();
     this.client = c;
     const opts = {
       host: cfg.host,
-      port: Number(cfg.port) || 22,
+      port: cfg.port || 22,
       username: cfg.username,
       readyTimeout: 15000,
       keepaliveInterval: 10000,
@@ -55,12 +53,6 @@ class SSHSession extends EventEmitter {
 
     c.on('ready', () => {
       this.emit_('status', { state: 'connected' });
-      c.shell({ term: 'xterm-256color' }, (err, stream) => {
-        if (err) return this.emit_('status', { state: 'failed', message: String(err.message || err) });
-        this.stream = stream;
-        stream.on('data', (d) => this.emit_('data', d.toString('base64')));
-        stream.on('close', () => this.close('会话已关闭'));
-      });
       c.sftp((err, sftp) => {
         if (err) return;
         this.sftp = sftp;
@@ -80,13 +72,42 @@ class SSHSession extends EventEmitter {
     c.connect(opts);
   }
 
-  write(data) {
-    if (this.stream) this.stream.write(data);
+  // 在当前连接上打开一个新的交互终端（paneId 由渲染进程分配）
+  openShell(paneId) {
+    if (!this.client || this.closed) {
+      return this.emit_('pane-error', { paneId, message: '连接未建立' });
+    }
+    this.client.shell({ term: 'xterm-256color' }, (err, stream) => {
+      if (err) return this.emit_('pane-error', { paneId, message: String(err.message || err) });
+      this.shells.set(paneId, stream);
+      stream.on('data', (d) => this.emit_('pane-data', { paneId, data: d.toString('base64') }));
+      stream.stderr.on('data', (d) => this.emit_('pane-data', { paneId, data: d.toString('base64') }));
+      stream.on('close', () => {
+        this.shells.delete(paneId);
+        this.emit_('pane-closed', { paneId });
+      });
+      stream.on('error', () => {});
+      this.emit_('pane-ready', { paneId });
+    });
   }
 
-  resize(cols, rows) {
-    if (this.stream) {
-      try { this.stream.setWindow(rows, cols, 0, 0); } catch (_) {}
+  write(paneId, data) {
+    const s = this.shells.get(paneId);
+    if (s) s.write(data);
+  }
+
+  resize(paneId, cols, rows) {
+    const s = this.shells.get(paneId);
+    if (s) {
+      try { s.setWindow(rows, cols, 0, 0); } catch (_) {}
+    }
+  }
+
+  closePane(paneId) {
+    const s = this.shells.get(paneId);
+    if (s) {
+      try { s.end(); } catch (_) {}
+      this.shells.delete(paneId);
     }
   }
 
@@ -126,10 +147,10 @@ class SSHSession extends EventEmitter {
       return out.slice(start + tag.length, next === -1 ? undefined : next);
     };
     // CPU
-    const statText = sec('##FS-END') && out.indexOf('cpu ') === 0 || true; // /proc/stat 是第一段
     const cpuLine = /^cpu\s+([\d\s]+)/m.exec(out);
+    if (!cpuLine) throw new Error('bad stats');
     const vals = cpuLine[1].trim().split(/\s+/).map(Number);
-    const user = vals[0], nice = vals[1], sys = vals[2], idle = vals[3] + (vals[4] || 0);
+    const idle = vals[3] + (vals[4] || 0);
     const steal = vals[6] || 0;
     const total = vals.reduce((a, b) => a + b, 0);
     let cpu = 0;
@@ -285,7 +306,7 @@ class SSHSession extends EventEmitter {
     this.sftp.stat(remote, (err, st) => {
       const total = err ? 0 : st.size;
       let last = 0;
-      this.sftp.fastGet(remote, local, { step: (t, chunk) => {
+      this.sftp.fastGet(remote, local, { step: (t) => {
         const now = Date.now();
         if (now - last > 200) {
           last = now;
@@ -325,11 +346,14 @@ class SSHSession extends EventEmitter {
     if (this.closed) return;
     this.closed = true;
     if (this.statsTimer) clearInterval(this.statsTimer);
-    try { this.stream && this.stream.end(); } catch (_) {}
+    for (const s of this.shells.values()) {
+      try { s.end(); } catch (_) {}
+    }
+    this.shells.clear();
     try { this.sftp && this.sftp.end(); } catch (_) {}
     try { this.client && this.client.end(); } catch (_) {}
     this.emit_('status', { state: 'closed', message: reason || '' });
   }
 }
 
-module.exports = { SSHSession, q };
+module.exports = { SSHSession };

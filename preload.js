@@ -7,8 +7,10 @@ contextBridge.exposeInMainWorld('api', {
   pickKeyFile: () => ipcRenderer.invoke('app:pickKeyFile'),
 
   connect: (tabId, conn) => ipcRenderer.invoke('ssh:connect', { tabId, conn }),
-  input: (tabId, data) => ipcRenderer.send('ssh:input', { tabId, data }),
-  resize: (tabId, cols, rows) => ipcRenderer.send('ssh:resize', { tabId, cols, rows }),
+  openPane: (tabId, paneId) => ipcRenderer.send('ssh:openPane', { tabId, paneId }),
+  input: (tabId, paneId, data) => ipcRenderer.send('ssh:input', { tabId, paneId, data }),
+  resize: (tabId, paneId, cols, rows) => ipcRenderer.send('ssh:resize', { tabId, paneId, cols, rows }),
+  closePane: (tabId, paneId) => ipcRenderer.send('ssh:closePane', { tabId, paneId }),
   close: (tabId) => ipcRenderer.send('ssh:close', { tabId }),
 
   sftpList: (tabId, dirPath) => ipcRenderer.send('sftp:list', { tabId, dirPath }),

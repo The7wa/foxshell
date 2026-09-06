@@ -34,6 +34,7 @@
         <div class="tabbar-actions">
           <button id="btnToggleCmd" class="icon-btn" title="快捷命令面板">⚡ 命令</button>
           <button id="btnToggleSftp" class="icon-btn" title="文件管理 (SFTP)">📂 文件</button>
+          <button id="btnTermSettings" class="icon-btn" title="终端外观设置">🎨 设置</button>
           <button id="btnDisconnect" class="icon-btn" title="断开当前连接">⏻ 断开</button>
         </div>
       </div>
@@ -159,7 +160,7 @@
     </form>
   </dialog>
 
-  <!-- 通用输入框（新建文件夹/重命名/自定义命令） -->
+  <!-- 通用输入框（新建文件夹/重命名） -->
   <dialog id="promptDialog">
     <form id="promptForm" method="dialog">
       <h3 id="promptTitle">输入</h3>
@@ -167,6 +168,55 @@
       <div class="dialog-actions">
         <button type="button" id="btnPromptCancel" class="btn">取消</button>
         <button type="submit" class="btn btn-primary">确定</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- 添加快捷命令 -->
+  <dialog id="cmdDialog">
+    <form id="cmdForm" method="dialog">
+      <h3>添加命令</h3>
+      <label>命令名称 <input name="cmdName" type="text" placeholder="如：查看磁盘" required /></label>
+      <label>命令 <input name="cmdText" type="text" placeholder="如：df -h" spellcheck="false" required /></label>
+      <div class="dialog-actions">
+        <button type="button" id="btnCmdCancel" class="btn">取消</button>
+        <button type="submit" class="btn btn-primary">添加</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- 终端外观设置 -->
+  <dialog id="termDialog">
+    <form id="termForm" method="dialog">
+      <h3>终端外观设置</h3>
+      <div class="row2">
+        <label>背景颜色 <input name="bg" type="color" /></label>
+        <label>字体颜色 <input name="fg" type="color" /></label>
+      </div>
+      <label>字体样式
+        <select name="font">
+          <option value='Consolas, "Courier New", monospace'>Consolas（默认）</option>
+          <option value='"Cascadia Mono", Consolas, monospace'>Cascadia Mono</option>
+          <option value='"Courier New", monospace'>Courier New</option>
+          <option value='"Lucida Console", monospace'>Lucida Console</option>
+          <option value='"Microsoft YaHei Mono", "Microsoft YaHei", monospace'>微软雅黑 Mono</option>
+          <option value='"SimSun-ExtB", SimSun, serif'>宋体</option>
+        </select>
+      </label>
+      <div class="row2">
+        <label>字体大小（8-28） <input name="size" type="number" min="8" max="28" /></label>
+        <label>光标样式
+          <select name="cursor">
+            <option value="block">方块 ▮</option>
+            <option value="bar">竖线 ▏</option>
+            <option value="underline">下划线 ▁</option>
+          </select>
+        </label>
+      </div>
+      <label class="check-line"><input name="blink" type="checkbox" /> 光标闪烁</label>
+      <div class="dialog-actions">
+        <button type="button" id="btnTermCancel" class="btn">取消</button>
+        <button type="submit" class="btn btn-primary">应用</button>
       </div>
     </form>
   </dialog>
