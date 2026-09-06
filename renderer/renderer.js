@@ -6,11 +6,32 @@ let conns = [];
 let tabs = new Map();
 let activeTabId = null;
 let sftpVisible = false;
+let cmdVisible = false;
 let editingConnId = null;
 let pickedKeyPath = null;
 
 const $ = (id) => document.getElementById(id);
 const uid = () => 't' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+const store = {
+  get(k, d) { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch (_) { return d; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (_) {} },
+};
+
+// 折叠的分组、空的分组、快捷命令都存 localStorage
+let collapsedGroups = store.get('foxshell.collapsed', []);
+let extraGroups = store.get('foxshell.groups', []);
+
+const DEFAULT_CMDS = [
+  { name: '磁盘占用', cmd: 'df -h' },
+  { name: '内存使用', cmd: 'free -h' },
+  { name: '系统负载', cmd: 'uptime' },
+  { name: '端口监听', cmd: 'ss -tulnp' },
+  { name: '进程 TOP15 (按CPU)', cmd: 'ps aux --sort=-%cpu | head -16' },
+  { name: '登录记录', cmd: 'last -20' },
+  { name: '失败登录', cmd: 'lastb -20 2>/dev/null | head -20' },
+  { name: '系统日志 50 行', cmd: 'journalctl -n 50 --no-pager' },
+];
+let cmdList = store.get('foxshell.cmds', null) || DEFAULT_CMDS.map((c) => ({ ...c }));
 
 // ---------------- 工具 ----------------
 function b64ToBytes(b64) {
@@ -45,49 +66,145 @@ function parentPath(p) {
   const idx = q.lastIndexOf('/');
   return idx <= 0 ? '/' : q.slice(0, idx);
 }
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"]/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]));
+}
 function toast(msg, bad) {
   const t = document.createElement('div');
   t.textContent = msg;
   t.style.cssText = `position:fixed;top:14px;left:50%;transform:translateX(-50%);
     background:${bad ? '#5b2422' : '#24422b'};color:#eee;padding:8px 18px;border-radius:8px;
-    font-size:13px;z-index:99;box-shadow:0 4px 16px rgba(0,0,0,.4);transition:opacity .4s;`;
+    font-size:13px;z-index:99;box-shadow:0 4px 16px rgba(0,0,0,.4);transition:opacity .4s;max-width:70%;`;
   document.body.appendChild(t);
   setTimeout(() => { t.style.opacity = '0'; }, 2200);
   setTimeout(() => t.remove(), 2700);
 }
+function allGroupNames() {
+  return [...new Set([...extraGroups, ...conns.map((c) => c.group || '')])].filter((g) => g !== '');
+}
 
-// ---------------- 连接管理 ----------------
+// ---------------- 初始化 ----------------
 async function init() {
   const data = await window.api.loadConns();
   conns = data.connections || [];
+  extraGroups = [...new Set([...extraGroups, ...(data.groups || [])])];
   window.api.onEvent(handleEvent);
   bindUI();
+  restorePanelWidths();
   renderConnList();
+  renderCmdList();
 }
 
+async function persist() {
+  const updated = await window.api.saveConns({
+    connections: conns,
+    groups: allGroupNames(),
+    secrets: {},
+  });
+  if (updated && updated.connections) conns = updated.connections;
+}
+
+// ---------------- 连接列表（文件夹分组 + 拖拽归组） ----------------
 function renderConnList() {
   const filter = $('searchBox').value.trim().toLowerCase();
   const list = $('connList');
   list.innerHTML = '';
-  const shown = conns.filter((c) =>
-    !filter || c.name.toLowerCase().includes(filter) || c.host.toLowerCase().includes(filter));
-  if (!shown.length) {
+
+  if (!conns.length && !extraGroups.length) {
     list.innerHTML = '<div class="empty-list">还没有服务器连接<br>点击下方「新建连接」添加</div>';
     return;
   }
-  const groups = new Map();
+  const shown = conns.filter((c) =>
+    !filter || c.name.toLowerCase().includes(filter) || c.host.toLowerCase().includes(filter));
+  if (!shown.length && filter) {
+    list.innerHTML = '<div class="empty-list">没有匹配的主机</div>';
+    return;
+  }
+
+  // 分组：命名分组在前（按名称），未分组最后
+  const gmap = new Map();
+  for (const g of allGroupNames().sort((a, b) => a.localeCompare(b))) gmap.set(g, []);
   for (const c of shown) {
-    const g = c.group || '未分组';
-    if (!groups.has(g)) groups.set(g, []);
-    groups.get(g).push(c);
+    const g = c.group || '';
+    if (!gmap.has(g)) gmap.set(g, []);
+    gmap.get(g).push(c);
   }
-  for (const [g, items] of groups) {
-    const gh = document.createElement('div');
-    gh.className = 'conn-group';
-    gh.textContent = g;
-    list.appendChild(gh);
-    for (const c of items) list.appendChild(connItemEl(c));
+  if (gmap.has('')) {
+    const un = gmap.get('');
+    gmap.delete('');
+    gmap.set('', un); // 未分组放最后
   }
+
+  for (const [g, items] of gmap) {
+    if (g === '' && !items.length) continue; // 空的未分组不显示
+    list.appendChild(groupHeaderEl(g, items.length));
+    if (!collapsedGroups.includes(g)) {
+      for (const c of items) list.appendChild(connItemEl(c));
+    }
+  }
+}
+
+function groupHeaderEl(g, count) {
+  const isCollapsed = collapsedGroups.includes(g);
+  const el = document.createElement('div');
+  el.className = 'conn-group' + (isCollapsed ? ' collapsed' : '');
+  el.dataset.group = g;
+  el.innerHTML = `
+    <span class="caret">${isCollapsed ? '▸' : '▾'}</span>
+    <span>${isCollapsed ? '📁' : '📂'}</span>
+    <span class="gname">${escapeHtml(g || '未分组')}</span>
+    <span class="gcount">${count}</span>
+    <span class="gactions">${g ? '<button data-act="gren" title="重命名分组">✎</button><button data-act="gdel" title="删除分组（连接移到未分组）">🗑</button>' : ''}</span>`;
+  el.addEventListener('click', (e) => {
+    if (e.target.closest('button')) return;
+    collapsedGroups = isCollapsed
+      ? collapsedGroups.filter((x) => x !== g)
+      : [...collapsedGroups, g];
+    store.set('foxshell.collapsed', collapsedGroups);
+    renderConnList();
+  });
+  // 拖拽归组
+  el.addEventListener('dragover', (e) => { e.preventDefault(); el.classList.add('dragover'); });
+  el.addEventListener('dragleave', () => el.classList.remove('dragover'));
+  el.addEventListener('drop', async (e) => {
+    e.preventDefault();
+    el.classList.remove('dragover');
+    const id = e.dataTransfer.getData('text/plain');
+    const c = conns.find((x) => x.id === id);
+    if (!c) return;
+    if ((c.group || '') === g) return;
+    c.group = g;
+    await persist();
+    renderConnList();
+    toast(`已把「${c.name}」移到「${g || '未分组'}」`);
+  });
+  const ren = el.querySelector('[data-act=gren]');
+  if (ren) ren.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    askText('重命名分组', g, async (name) => {
+      if (!name || name === g) return;
+      for (const c of conns) if ((c.group || '') === g) c.group = name;
+      extraGroups = extraGroups.map((x) => (x === g ? name : x));
+      collapsedGroups = collapsedGroups.map((x) => (x === g ? name : x));
+      store.set('foxshell.groups', extraGroups);
+      store.set('foxshell.collapsed', collapsedGroups);
+      await persist();
+      renderConnList();
+    });
+  });
+  const del = el.querySelector('[data-act=gdel]');
+  if (del) del.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    if (!confirm(`删除分组「${g}」？组内 ${count} 个连接将移到「未分组」。`)) return;
+    for (const c of conns) if ((c.group || '') === g) c.group = '';
+    extraGroups = extraGroups.filter((x) => x !== g);
+    collapsedGroups = collapsedGroups.filter((x) => x !== g);
+    store.set('foxshell.groups', extraGroups);
+    store.set('foxshell.collapsed', collapsedGroups);
+    await persist();
+    renderConnList();
+  });
+  return el;
 }
 
 function connItemEl(c) {
@@ -96,16 +213,25 @@ function connItemEl(c) {
   const el = document.createElement('div');
   el.className = 'conn-item';
   el.title = `${c.username}@${c.host}:${c.port}`;
+  el.draggable = true;
   const dotCls = st === 'connected' ? 'on' : st === 'connecting' ? 'busy'
     : (st === 'closed' || st === 'failed') ? 'off' : '';
   el.innerHTML = `
     <span class="dot ${dotCls}"></span>
     <span class="cname">${escapeHtml(c.name)}</span>
     <span class="actions">
+      <button data-act="clone" title="克隆连接">⧉</button>
       <button data-act="edit" title="编辑">✎</button>
       <button data-act="del" title="删除">🗑</button>
     </span>`;
   el.addEventListener('dblclick', () => connectConn(c));
+  el.addEventListener('dragstart', (e) => {
+    e.dataTransfer.setData('text/plain', c.id);
+    e.dataTransfer.effectAllowed = 'move';
+    el.classList.add('dragging');
+  });
+  el.addEventListener('dragend', () => el.classList.remove('dragging'));
+  el.querySelector('[data-act=clone]').addEventListener('click', (e) => { e.stopPropagation(); openConnDialog(c, true); });
   el.querySelector('[data-act=edit]').addEventListener('click', (e) => { e.stopPropagation(); openConnDialog(c); });
   el.querySelector('[data-act=del]').addEventListener('click', async (e) => {
     e.stopPropagation();
@@ -117,23 +243,14 @@ function connItemEl(c) {
   return el;
 }
 
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"]/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]));
-}
-
-async function persist() {
-  const updated = await window.api.saveConns({ connections: conns, secrets: {} });
-  if (updated && updated.connections) conns = updated.connections;
-}
-
 // ---------------- 连接对话框 ----------------
-function openConnDialog(conn) {
-  editingConnId = conn ? conn.id : null;
+function openConnDialog(conn, clone) {
+  editingConnId = conn && !clone ? conn.id : null;
   pickedKeyPath = conn ? conn.keyPath || null : null;
-  $('connDialogTitle').textContent = conn ? '编辑连接' : '新建连接';
+  $('connDialogTitle').textContent = clone ? '克隆连接' : conn ? '编辑连接' : '新建连接';
   const f = $('connForm');
   const F = (n) => f.elements[n];
-  F('name').value = conn ? conn.name : '';
+  F('name').value = conn ? (clone ? conn.name + ' 副本' : conn.name) : '';
   F('host').value = conn ? conn.host : '';
   F('port').value = conn ? conn.port || 22 : 22;
   F('username').value = conn ? conn.username : 'root';
@@ -141,8 +258,9 @@ function openConnDialog(conn) {
   F('authType').value = conn ? conn.authType || 'password' : 'password';
   F('password').value = '';
   F('passphrase').value = '';
-  F('password').placeholder = conn ? '留空则保持原密码' : '';
+  F('password').placeholder = conn && !clone ? '留空则保持原密码' : '';
   $('keyPathText').value = pickedKeyPath || '';
+  $('groupSuggestions').innerHTML = allGroupNames().map((g) => `<option value="${escapeHtml(g)}">`).join('');
   toggleAuthRows();
   $('connDialog').showModal();
 }
@@ -159,27 +277,30 @@ async function saveConnForm(e) {
     const f = $('connForm');
     const F = (n) => f.elements[n];
     const id = editingConnId || uid().replace('t', 'c');
-  const old = conns.find((c) => c.id === id);
-  const rec = {
-    id,
-    name: F('name').value.trim() || F('host').value.trim(),
-    host: F('host').value.trim(),
-    port: Number(F('port').value) || 22,
-    username: F('username').value.trim() || 'root',
-    group: F('group').value.trim(),
-    authType: F('authType').value,
-    passwordEnc: old ? old.passwordEnc : '',
-    keyPath: F('authType').value === 'key' ? pickedKeyPath : '',
-    passphraseEnc: old ? old.passphraseEnc : '',
-  };
-  if (!rec.keyPath && rec.authType === 'key') {
-    toast('请选择私钥文件', true);
-    return;
-  }
-  const secrets = { [id]: { password: F('password').value, passphrase: F('passphrase').value } };
-  if (old) conns = conns.map((c) => (c.id === id ? rec : c));
-  else conns.push(rec);
-  const updated = await window.api.saveConns({ connections: conns, secrets });
+    const old = conns.find((c) => c.id === id);
+    const group = F('group').value.trim();
+    const rec = {
+      id,
+      name: F('name').value.trim() || F('host').value.trim(),
+      host: F('host').value.trim(),
+      port: Number(F('port').value) || 22,
+      username: F('username').value.trim() || 'root',
+      group,
+      authType: F('authType').value,
+      passwordEnc: old ? old.passwordEnc : '',
+      keyPath: F('authType').value === 'key' ? pickedKeyPath : '',
+      passphraseEnc: old ? old.passphraseEnc : '',
+    };
+    if (!rec.keyPath && rec.authType === 'key') {
+      toast('请选择私钥文件', true);
+      return;
+    }
+    if (group && !allGroupNames().includes(group)) extraGroups = [...extraGroups, group];
+    const secrets = { [id]: { password: F('password').value, passphrase: F('passphrase').value } };
+    if (old) conns = conns.map((c) => (c.id === id ? rec : c));
+    else conns.push(rec);
+    store.set('foxshell.groups', extraGroups);
+    const updated = await window.api.saveConns({ connections: conns, groups: allGroupNames(), secrets });
     if (updated && updated.connections) conns = updated.connections;
     $('connDialog').close();
     renderConnList();
@@ -203,7 +324,7 @@ function createTab(conn) {
   $('termStack').appendChild(wrap);
 
   const term = new Terminal({
-    fontSize: 13,
+    fontSize: store.get('foxshell.font', 13),
     fontFamily: 'Consolas, "Courier New", monospace',
     cursorBlink: true,
     scrollback: 5000,
@@ -410,9 +531,10 @@ function renderMonitor() {
   $('monUptime').textContent = humanUptime(s.uptime);
 }
 
-// ---------------- SFTP 面板 ----------------
+// ---------------- 面板显示/隐藏 与 宽度拖拽 ----------------
 function refreshSftpPanel() {
   $('sftpPanel').classList.toggle('hidden', !sftpVisible);
+  $('sftpSplitter').classList.toggle('hidden', !sftpVisible);
   $('btnToggleSftp').classList.toggle('active', sftpVisible);
   if (!sftpVisible) return;
   const tab = tabs.get(activeTabId);
@@ -425,6 +547,94 @@ function refreshSftpPanel() {
   else renderSftpList();
 }
 
+function refreshCmdPanel() {
+  $('cmdPanel').classList.toggle('hidden', !cmdVisible);
+  $('cmdSplitter').classList.toggle('hidden', !cmdVisible);
+  $('btnToggleCmd').classList.toggle('active', cmdVisible);
+}
+
+function makeVResizable(handle, panel, { dir, min, max, key }) {
+  handle.addEventListener('mousedown', (e) => {
+    e.preventDefault();
+    handle.classList.add('dragging');
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+    const startX = e.clientX;
+    const startW = panel.getBoundingClientRect().width;
+    const onMove = (ev) => {
+      let w = dir === 'left' ? startW + (ev.clientX - startX) : startW - (ev.clientX - startX);
+      w = Math.max(min, Math.min(max, w));
+      panel.style.width = w + 'px';
+      panel.style.minWidth = w + 'px';
+      panel.style.maxWidth = w + 'px';
+    };
+    const onUp = () => {
+      handle.classList.remove('dragging');
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+      store.set(key, panel.getBoundingClientRect().width);
+    };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  });
+}
+
+function applyWidth(panel, w, min, max) {
+  if (!w) return;
+  w = Math.max(min, Math.min(max, Number(w) || 0));
+  panel.style.width = w + 'px';
+  panel.style.minWidth = w + 'px';
+  panel.style.maxWidth = w + 'px';
+}
+
+function restorePanelWidths() {
+  applyWidth($('sidebar'), store.get('foxshell.w.side'), 160, 480);
+  applyWidth($('sftpPanel'), store.get('foxshell.w.sftp'), 220, 640);
+  applyWidth($('cmdPanel'), store.get('foxshell.w.cmd'), 170, 480);
+  makeVResizable($('sideSplitter'), $('sidebar'), { dir: 'left', min: 160, max: 480, key: 'foxshell.w.side' });
+  makeVResizable($('sftpSplitter'), $('sftpPanel'), { dir: 'right', min: 220, max: 640, key: 'foxshell.w.sftp' });
+  makeVResizable($('cmdSplitter'), $('cmdPanel'), { dir: 'right', min: 170, max: 480, key: 'foxshell.w.cmd' });
+}
+
+// ---------------- 快捷命令面板 ----------------
+function renderCmdList() {
+  const box = $('cmdList');
+  box.innerHTML = '';
+  for (const [i, c] of cmdList.entries()) {
+    const el = document.createElement('div');
+    el.className = 'cmd-block';
+    el.title = c.cmd + '\n点击在当前终端执行';
+    el.innerHTML = `
+      <div class="cmd-name">${escapeHtml(c.name)}</div>
+      <div class="cmd-text">${escapeHtml(c.cmd)}</div>
+      <button class="cmd-del" title="删除命令">✕</button>`;
+    el.addEventListener('click', (e) => {
+      if (e.target.closest('.cmd-del')) return;
+      runCommand(c);
+    });
+    el.querySelector('.cmd-del').addEventListener('click', () => {
+      cmdList.splice(i, 1);
+      store.set('foxshell.cmds', cmdList);
+      renderCmdList();
+    });
+    box.appendChild(el);
+  }
+}
+
+function runCommand(c) {
+  const tab = tabs.get(activeTabId);
+  if (!tab || tab.state !== 'connected') {
+    toast('请先连接服务器', true);
+    return;
+  }
+  window.api.input(tab.id, c.cmd + '\r');
+  toast(`已执行：${c.name}`);
+  tab.term.focus();
+}
+
+// ---------------- SFTP 面板 ----------------
 function renderSftpList() {
   const tab = tabs.get(activeTabId);
   if (!tab || tab.sftp.cwd == null) return;
@@ -486,6 +696,15 @@ function askText(title, def, cb) {
 // ---------------- 事件绑定 ----------------
 function bindUI() {
   $('btnAddConn').addEventListener('click', () => openConnDialog(null));
+  $('btnAddGroup').addEventListener('click', () => {
+    askText('新建分组名称', '', async (name) => {
+      if (!name) return;
+      if (allGroupNames().includes(name)) { toast('分组已存在', true); return; }
+      extraGroups = [...extraGroups, name];
+      store.set('foxshell.groups', extraGroups);
+      renderConnList();
+    });
+  });
   $('authTypeSel').addEventListener('change', toggleAuthRows);
   $('btnPickKey').addEventListener('click', async () => {
     const p = await window.api.pickKeyFile();
@@ -509,6 +728,10 @@ function bindUI() {
     sftpVisible = !sftpVisible;
     refreshSftpPanel();
   });
+  $('btnToggleCmd').addEventListener('click', () => {
+    cmdVisible = !cmdVisible;
+    refreshCmdPanel();
+  });
 
   // 终端自适应
   const ro = new ResizeObserver(() => {
@@ -518,6 +741,19 @@ function bindUI() {
     }
   });
   ro.observe($('termStack'));
+
+  // Ctrl + 滚轮调整终端字体大小
+  $('termStack').addEventListener('wheel', (e) => {
+    if (!e.ctrlKey) return;
+    e.preventDefault();
+    const tab = tabs.get(activeTabId);
+    if (!tab) return;
+    const cur = tab.term.options.fontSize;
+    const n = Math.max(8, Math.min(28, cur + (e.deltaY < 0 ? 1 : -1)));
+    for (const t of tabs.values()) t.term.options.fontSize = n;
+    store.set('foxshell.font', n);
+    try { tab.fit.fit(); } catch (_) {}
+  }, { passive: false });
 
   // SFTP 工具栏
   const goPath = () => {
@@ -561,6 +797,19 @@ function bindUI() {
     if (!ent) { toast('请先选中文件或文件夹', true); return; }
     askText('重命名', ent.name, (name) => {
       if (name && name !== ent.name) window.api.sftpRename(tab.id, tab.sftp.cwd, ent.name, name);
+    });
+  });
+
+  // 快捷命令
+  $('btnCmdAdd').addEventListener('click', () => {
+    askText('命令名称（如：查看磁盘）', '', (name) => {
+      if (!name) return;
+      askText('要执行的命令', '', (cmd) => {
+        if (!cmd) return;
+        cmdList.push({ name, cmd });
+        store.set('foxshell.cmds', cmdList);
+        renderCmdList();
+      });
     });
   });
 }

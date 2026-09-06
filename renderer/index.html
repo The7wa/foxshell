@@ -10,7 +10,7 @@
 </head>
 <body>
   <div id="app">
-    <!-- 左栏：连接管理器 -->
+    <!-- 左栏：连接管理器（文件夹分组） -->
     <aside id="sidebar">
       <div class="side-header">
         <span class="logo">🦊 FoxShell</span>
@@ -20,9 +20,11 @@
       </div>
       <div id="connList" class="conn-list"></div>
       <div class="side-footer">
+        <button id="btnAddGroup" class="mini-btn btn-block" style="margin-bottom:8px">＋ 新建分组</button>
         <button id="btnAddConn" class="btn btn-primary btn-block">＋ 新建连接</button>
       </div>
     </aside>
+    <div id="sideSplitter" class="splitter-v" title="拖动调整宽度"></div>
 
     <!-- 中/右主区域 -->
     <div id="main">
@@ -30,6 +32,7 @@
       <div id="tabbar">
         <div id="tabs"></div>
         <div class="tabbar-actions">
+          <button id="btnToggleCmd" class="icon-btn" title="快捷命令面板">⚡ 命令</button>
           <button id="btnToggleSftp" class="icon-btn" title="文件管理 (SFTP)">📂 文件</button>
           <button id="btnDisconnect" class="icon-btn" title="断开当前连接">⏻ 断开</button>
         </div>
@@ -42,7 +45,7 @@
             <div class="welcome-logo">🦊</div>
             <h2>FoxShell</h2>
             <p>双击左侧主机建立 SSH 连接</p>
-            <p class="dim">支持密码 / 密钥登录 · SFTP 文件管理 · 服务器资源监控</p>
+            <p class="dim">支持密码 / 密钥登录 · SFTP 文件管理 · 服务器资源监控 · 快捷命令</p>
           </div>
           <div id="termStack"></div>
           <div id="monitor">
@@ -76,7 +79,19 @@
           </div>
         </div>
 
-        <!-- 右侧：SFTP 文件管理 -->
+        <!-- 快捷命令面板 -->
+        <div id="cmdSplitter" class="splitter-v hidden"></div>
+        <div id="cmdPanel" class="hidden">
+          <div class="panel-title">
+            <span>⚡ 快捷命令</span>
+            <button id="btnCmdAdd" class="mini-btn" title="添加自定义命令">＋ 添加</button>
+          </div>
+          <div id="cmdList"></div>
+          <div class="panel-tip">点击命令块即在当前连接的终端中执行</div>
+        </div>
+
+        <!-- SFTP 文件管理 -->
+        <div id="sftpSplitter" class="splitter-v hidden"></div>
         <div id="sftpPanel" class="hidden">
           <div class="sftp-toolbar">
             <button id="btnSftpUp" class="icon-btn" title="上一级">⬆</button>
@@ -116,7 +131,10 @@
       </div>
       <div class="row2">
         <label>用户名 <input name="username" type="text" value="root" required /></label>
-        <label>分组 <input name="group" type="text" placeholder="可选" /></label>
+        <label>分组
+          <input name="group" type="text" list="groupSuggestions" placeholder="未分组" />
+          <datalist id="groupSuggestions"></datalist>
+        </label>
       </div>
       <label>认证方式
         <select name="authType" id="authTypeSel">
@@ -141,7 +159,7 @@
     </form>
   </dialog>
 
-  <!-- 通用输入框（新建文件夹/重命名） -->
+  <!-- 通用输入框（新建文件夹/重命名/自定义命令） -->
   <dialog id="promptDialog">
     <form id="promptForm" method="dialog">
       <h3 id="promptTitle">输入</h3>

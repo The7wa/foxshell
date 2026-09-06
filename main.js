@@ -79,6 +79,7 @@ app.whenReady().then(() => {
   ipcMain.handle('conns:load', () => loadConns());
   ipcMain.handle('conns:save', (e, data) => {
     const list = data.connections || [];
+    const groups = data.groups || [];
     const secrets = data.secrets || {};
     for (const c of list) {
       const s = secrets[c.id];
@@ -87,8 +88,8 @@ app.whenReady().then(() => {
         if (s.passphrase) c.passphraseEnc = enc(s.passphrase);
       }
     }
-    saveConns({ connections: list });
-    return { connections: list };
+    saveConns({ connections: list, groups });
+    return { connections: list, groups };
   });
 
   ipcMain.handle('app:pickKeyFile', async () => {
