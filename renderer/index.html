@@ -171,16 +171,11 @@
         </label>
         <label>私钥口令 <input name="passphrase" type="password" placeholder="无则留空" /></label>
       </div>
-      <label class="check-line"><input name="useJump" type="checkbox" id="useJumpChk" /> 通过跳板机（堡垒机）连接</label>
+      <label class="check-line"><input type="checkbox" id="useJumpChk" /> 通过跳板机（堡垒机）连接</label>
       <div id="rowJump" style="display:none">
-        <div class="row2">
-          <label>跳板机地址 <input name="jumpHost" type="text" placeholder="如 10.0.0.1" /></label>
-          <label>跳板机端口 <input name="jumpPort" type="number" value="22" min="1" max="65535" /></label>
-        </div>
-        <div class="row2">
-          <label>跳板机用户名 <input name="jumpUser" type="text" placeholder="同目标用户名" /></label>
-          <label>跳板机密码 <input name="jumpPassword" type="password" placeholder="留空则保持原密码" /></label>
-        </div>
+        <div id="jumpList"></div>
+        <button type="button" id="btnJumpAdd" class="mini-btn" style="margin:4px 0 8px">＋ 添加跳板机</button>
+        <div class="panel-tip">连接顺序：跳板机 1 → 跳板机 2 → … → 目标服务器，数量不限。</div>
       </div>
       <div class="dialog-actions">
         <button type="button" id="btnConnCancel" class="btn">取消</button>
@@ -196,6 +191,19 @@
       <input id="promptInput" type="text" spellcheck="false" />
       <div class="dialog-actions">
         <button type="button" id="btnPromptCancel" class="btn">取消</button>
+        <button type="submit" class="btn btn-primary">确定</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- 导入/导出口令 -->
+  <dialog id="secretDialog">
+    <form id="secretForm" method="dialog">
+      <h3 id="secretTitle">输入口令</h3>
+      <label id="secretDesc">用于加密导出的连接文件</label>
+      <input id="secretInput" type="password" autocomplete="new-password" spellcheck="false" />
+      <div class="dialog-actions">
+        <button type="button" id="btnSecretCancel" class="btn">取消</button>
         <button type="submit" class="btn btn-primary">确定</button>
       </div>
     </form>

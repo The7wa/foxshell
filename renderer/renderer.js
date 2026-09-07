@@ -140,7 +140,7 @@ async function persist() {
       if (c) {
         c.passwordEnc = u.passwordEnc;
         c.passphraseEnc = u.passphraseEnc;
-        c.jumpPasswordEnc = u.jumpPasswordEnc;
+        c.jumps = Array.isArray(u.jumps) ? u.jumps.map((j) => ({ ...j })) : [];
       }
     }
   }
@@ -299,13 +299,17 @@ function openConnDialog(conn, clone) {
   F('password').value = '';
   F('passphrase').value = '';
   F('password').placeholder = conn && !clone ? '留空则保持原密码' : '';
-  F('useJump').checked = !!(conn && conn.useJump);
-  F('jumpHost').value = conn ? conn.jumpHost || '' : '';
-  F('jumpPort').value = conn ? conn.jumpPort || 22 : 22;
-  F('jumpUser').value = conn ? conn.jumpUsername || '' : '';
-  F('jumpPassword').value = '';
-  F('jumpPassword').placeholder = conn && !clone ? '留空则保持原密码' : '';
-  $('rowJump').style.display = F('useJump').checked ? '' : 'none';
+  // 跳板机链：编辑时展开为可增删的列表
+  jumpDraft = (conn && Array.isArray(conn.jumps) ? conn.jumps : []).map((j) => ({
+    host: j.host || '',
+    port: j.port || 22,
+    username: j.username || '',
+    passwordEnc: j.passwordEnc || '',
+    password: '',
+  }));
+  $('useJumpChk').checked = !!(conn && conn.jumps && conn.jumps.length);
+  $('rowJump').style.display = $('useJumpChk').checked ? '' : 'none';
+  renderJumpList(conn && !clone);
   $('keyPathText').value = pickedKeyPath || '';
   $('groupSuggestions').innerHTML = allGroupNames().map((g) => `<option value="${escapeHtml(g)}">`).join('');
   toggleAuthRows();
@@ -318,6 +322,62 @@ function toggleAuthRows() {
   $('rowKey').style.display = isKey ? '' : 'none';
 }
 
+// ---------- 跳板机链（数量不限） ----------
+let jumpDraft = []; // 编辑中的跳板机草稿 [{host,port,username,passwordEnc,password}]
+
+function addJumpRow() {
+  jumpDraft.push({ host: '', port: 22, username: '', passwordEnc: '', password: '' });
+  renderJumpList(true);
+}
+
+function renderJumpList(keepPw) {
+  const box = $('jumpList');
+  box.innerHTML = '';
+  jumpDraft.forEach((j, i) => {
+    const row = document.createElement('div');
+    row.className = 'jump-row';
+    row.innerHTML = `
+      <div class="jump-head">
+        <span class="jn">跳板机 ${i + 1}</span>
+        ${i > 0 ? `<button type="button" data-a="up" title="上移">↑</button>` : ''}
+        ${i < jumpDraft.length - 1 ? `<button type="button" data-a="down" title="下移">↓</button>` : ''}
+        <button type="button" data-a="del" title="删除此跳板机">🗑</button>
+      </div>
+      <div class="row2">
+        <label>地址 <input data-f="host" type="text" placeholder="如 10.0.0.1" value="${escapeHtml(j.host)}" /></label>
+        <label>端口 <input data-f="port" type="number" min="1" max="65535" value="${j.port || 22}" /></label>
+      </div>
+      <div class="row2">
+        <label>用户名 <input data-f="username" type="text" placeholder="默认同目标用户名" value="${escapeHtml(j.username)}" /></label>
+        <label>密码 <input data-f="password" type="password" placeholder="${keepPw && j.passwordEnc ? '留空则保持原密码' : '无则留空'}" value="" /></label>
+      </div>`;
+    row.querySelectorAll('[data-f]').forEach((inp) => {
+      inp.addEventListener('input', () => {
+        const f = inp.dataset.f;
+        if (f === 'port') jumpDraft[i].port = Number(inp.value) || 22;
+        else jumpDraft[i][f] = inp.value;
+      });
+    });
+    const pwInput = row.querySelector('[data-f=password]');
+    if (pwInput) pwInput.value = String(j.password || '');
+    row.querySelector('[data-a=del]').addEventListener('click', () => {
+      jumpDraft.splice(i, 1);
+      renderJumpList(keepPw);
+    });
+    const up = row.querySelector('[data-a=up]');
+    if (up) up.addEventListener('click', () => {
+      [jumpDraft[i - 1], jumpDraft[i]] = [jumpDraft[i], jumpDraft[i - 1]];
+      renderJumpList(keepPw);
+    });
+    const down = row.querySelector('[data-a=down]');
+    if (down) down.addEventListener('click', () => {
+      [jumpDraft[i + 1], jumpDraft[i]] = [jumpDraft[i], jumpDraft[i + 1]];
+      renderJumpList(keepPw);
+    });
+    box.appendChild(row);
+  });
+}
+
 async function saveConnForm(e) {
   e.preventDefault();
   try {
@@ -326,7 +386,8 @@ async function saveConnForm(e) {
     const id = editingConnId || uid().replace('t', 'c');
     const old = conns.find((c) => c.id === id);
     const group = F('group').value.trim();
-    const useJump = F('useJump').checked;
+    const useJump = $('useJumpChk').checked;
+    const jumpRows = useJump ? jumpDraft.filter((j) => j.host.trim()) : [];
     const rec = {
       id,
       name: F('name').value.trim() || F('host').value.trim(),
@@ -338,19 +399,22 @@ async function saveConnForm(e) {
       passwordEnc: old ? old.passwordEnc : '',
       keyPath: F('authType').value === 'key' ? pickedKeyPath : '',
       passphraseEnc: old ? old.passphraseEnc : '',
-      useJump,
-      jumpHost: useJump ? F('jumpHost').value.trim() : '',
-      jumpPort: useJump ? Number(F('jumpPort').value) || 22 : 22,
-      jumpUsername: useJump ? F('jumpUser').value.trim() : '',
-      jumpPasswordEnc: old ? old.jumpPasswordEnc || '' : '',
+      jumps: jumpRows.map((j) => ({
+        host: j.host.trim(),
+        port: Number(j.port) || 22,
+        username: j.username.trim(),
+        // 密码：新输入的用明文经 secrets 提交加密；没输入的保留原密文
+        passwordEnc: (old && old.jumps && old.jumps.some((x) => x.host === j.host.trim()) && !j.password)
+          ? (old.jumps.find((x) => x.host === j.host.trim()) || {}).passwordEnc || '' : '',
+      })),
       forwards: old ? old.forwards || [] : [],
     };
     if (!rec.keyPath && rec.authType === 'key') {
       toast('请选择私钥文件', true);
       return;
     }
-    if (useJump && !rec.jumpHost) {
-      toast('请填写跳板机地址', true);
+    if (useJump && !jumpRows.length) {
+      toast('请至少添加一台跳板机地址', true);
       return;
     }
     if (group && !allGroupNames().includes(group)) extraGroups = [...extraGroups, group];
@@ -358,8 +422,8 @@ async function saveConnForm(e) {
       [id]: {
         password: F('password').value,
         passphrase: F('passphrase').value,
-        jumpPassword: F('jumpPassword').value,
       },
+      jumps: { [id]: jumpRows.map((j) => j.password || '') },
     };
     if (old) Object.assign(old, rec); // 原地更新，保持引用（tab.conn 同步）
     else conns.push(rec);
@@ -371,7 +435,7 @@ async function saveConnForm(e) {
         if (c) {
           c.passwordEnc = u.passwordEnc;
           c.passphraseEnc = u.passphraseEnc;
-          c.jumpPasswordEnc = u.jumpPasswordEnc;
+          c.jumps = Array.isArray(u.jumps) ? u.jumps.map((j) => ({ ...j })) : [];
         }
       }
     }
@@ -1108,12 +1172,24 @@ function doDownload(ent) {
 
 // ---------------- 通用输入对话框 ----------------
 let promptCb = null;
+let secretCb = null;
 function askText(title, def, cb) {
   $('promptTitle').textContent = title;
   $('promptInput').value = def || '';
   promptCb = cb;
   $('promptDialog').showModal();
   setTimeout(() => { $('promptInput').select(); }, 50);
+}
+function askSecret(title, desc, cb) {
+  $('secretTitle').textContent = title;
+  $('secretDesc').textContent = desc;
+  $('secretInput').value = '';
+  secretCb = cb;
+  $('secretDialog').showModal();
+  setTimeout(() => { $('secretInput').select(); }, 50);
+}
+function askSecretAsync(title, desc) {
+  return new Promise((resolve) => askSecret(title, desc, resolve));
 }
 
 // ---------------- 事件绑定 ----------------
@@ -1143,6 +1219,21 @@ function bindUI() {
     if (promptCb) promptCb($('promptInput').value.trim());
     promptCb = null;
   });
+  $('btnSecretCancel').addEventListener('click', () => {
+    $('secretDialog').close();
+    if (secretCb) secretCb(null);
+    secretCb = null;
+  });
+  $('secretForm').addEventListener('submit', (e) => {
+    e.preventDefault();
+    $('secretDialog').close();
+    if (secretCb) secretCb($('secretInput').value);
+    secretCb = null;
+  });
+  $('secretDialog').addEventListener('cancel', () => {
+    if (secretCb) secretCb(null);
+    secretCb = null;
+  });
 
   // 添加命令（居中对话框：第一栏名称，第二栏命令）
   $('btnCmdAdd').addEventListener('click', () => {
@@ -1171,7 +1262,9 @@ function bindUI() {
   // 跳板机开关
   $('useJumpChk').addEventListener('change', () => {
     $('rowJump').style.display = $('useJumpChk').checked ? '' : 'none';
+    if ($('useJumpChk').checked && !jumpDraft.length) addJumpRow();
   });
+  $('btnJumpAdd').addEventListener('click', addJumpRow);
 
   // 端口转发
   $('btnForward').addEventListener('click', openFwdDialog);
@@ -1202,12 +1295,34 @@ function bindUI() {
   // 连接配置导入 / 导出
   $('btnExportConns').addEventListener('click', async () => {
     if (!conns.length) { toast('还没有可导出的连接', true); return; }
-    const r = await window.api.exportConns(conns);
-    if (r.ok) toast('已导出到：' + r.path);
+    const p1 = await askSecretAsync('设置导出口令', '导出文件将加密保存，不包含明文口令。请务必记住此口令。');
+    if (p1 == null) return;
+    if (!p1) { toast('导出口令不能为空', true); return; }
+    const p2 = await askSecretAsync('确认导出口令', '再次输入刚才设置的导出口令。');
+    if (p2 == null) return;
+    if (p1 !== p2) { toast('两次输入的口令不一致', true); return; }
+    const r = await window.api.exportConns(conns, p1);
+    if (r.ok) toast('已加密导出到：' + r.path);
+    else if (r.error) toast('导出失败：' + r.error, true);
   });
   $('btnImportConns').addEventListener('click', async () => {
     const r = await window.api.importConns();
     if (!r.ok) {
+      if (r.needsPassword) {
+        const password = await askSecretAsync('输入导出口令', '此导出文件已加密，需要输入导出时设置的口令。');
+        if (password == null) return;
+        const r2 = await window.api.importConns(password, r.path);
+        if (!r2.ok) {
+          toast('导入失败：' + (r2.error || '未知错误'), true);
+          return;
+        }
+        conns = conns.concat(r2.connections);
+        const updated = await window.api.saveConns({ connections: conns, groups: allGroupNames(), secrets: {} });
+        if (updated && updated.connections) conns = updated.connections;
+        renderConnList();
+        toast(`已导入 ${r2.count} 个连接`);
+        return;
+      }
       if (r.error) toast('导入失败：' + r.error, true);
       return;
     }

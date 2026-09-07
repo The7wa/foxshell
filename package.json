@@ -1,6 +1,6 @@
 {
   "name": "foxshell",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "FoxShell - SSH 连接管理客户端",
   "main": "main.js",
   "scripts": {
@@ -31,6 +31,8 @@
     "directories": {
       "output": "dist"
     },
+    "npmRebuild": false,
+    "electronDist": "node_modules/electron/dist",
     "files": [
       "main.js",
       "ssh.js",

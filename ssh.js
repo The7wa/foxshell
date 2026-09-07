@@ -14,8 +14,9 @@ class SSHSession extends EventEmitter {
     this.tabId = tabId;
     this.send = send; // (type, payload) => webContents.send('ssh-event', {tabId, type, payload})
     this.client = null;
-    this.jumpClient = null;
+    this.jumpClients = []; // 跳板机链上的所有中间 Client
     this.sftp = null;
+    this._sftpQ = null; // 惰性 SFTP 初始化的等待队列
     this.shells = new Map(); // paneId -> shell stream（一个连接可开多个终端，供分屏使用）
     this.forwards = new Map(); // 转发规则 id -> net.Server
     this.statsTimer = null;
@@ -40,6 +41,13 @@ class SSHSession extends EventEmitter {
     });
   }
 
+  cleanupHops() {
+    for (const jc of this.jumpClients) {
+      try { jc.end(); } catch (_) {}
+    }
+    this.jumpClients = [];
+  }
+
   async connect(cfg) {
     this.cfg = cfg;
     const c = new Client();
@@ -49,9 +57,10 @@ class SSHSession extends EventEmitter {
       port: cfg.port || 22,
       username: cfg.username,
       readyTimeout: 15000,
-      keepaliveInterval: 10000,
-      keepaliveCountMax: 3,
+      keepaliveInterval: 15000,
       tryKeyboard: true,
+      hostHash: cfg.hostHash || 'sha256',
+      hostVerifier: cfg.hostVerifier || ((_fp, done) => done(false)),
     };
     if (cfg.authType === 'key') {
       opts.privateKey = cfg.keyData; // Buffer
@@ -61,27 +70,43 @@ class SSHSession extends EventEmitter {
     }
 
     try {
-      // 跳板机：先连跳板机，再通过 forwardOut 通道连目标（支持一层跳板）
-      if (cfg.jumpHost) {
-        this.emit_('status', { state: 'connecting', message: `正在连接跳板机 ${cfg.jumpHost}...` });
-        const jump = new Client();
-        this.jumpClient = jump;
-        await this.dial(jump, {
-          host: cfg.jumpHost,
-          port: cfg.jumpPort || 22,
-          username: cfg.jumpUsername || cfg.username,
+      // 跳板机链：数量不限，按顺序 跳板1 → 跳板2 → … → 目标
+      const hops = cfg.jumps || [];
+      let sock = null;
+      for (let i = 0; i < hops.length; i++) {
+        const hop = hops[i];
+        const jc = new Client();
+        const hopOpts = {
+          host: hop.host,
+          port: hop.port || 22,
+          username: hop.username || cfg.username || 'root',
+          password: hop.password,
           readyTimeout: 15000,
-          keepaliveInterval: 10000,
+          keepaliveInterval: 15000,
           tryKeyboard: true,
-        }, cfg.jumpPassword);
-        this.emit_('status', { state: 'connecting', message: '跳板机已连接，正在连接目标服务器...' });
-        const stream = await new Promise((resolve, reject) => {
-          jump.forwardOut('127.0.0.1', 0, cfg.host, cfg.port || 22, (err, s) => (err ? reject(err) : resolve(s)));
+          hostHash: hop.hostHash || cfg.hostHash || 'sha256',
+          hostVerifier: hop.hostVerifier || ((_fp, done) => done(false)),
+        };
+        if (sock) hopOpts.sock = sock; // 上一跳建立的隧道
+        this.emit_('status', { state: 'connecting', message: `跳板机 ${i + 1}/${hops.length} ${hop.host}...` });
+        try {
+          await this.dial(jc, hopOpts, hop.password);
+        } catch (err) {
+          throw new Error(`跳板机 ${i + 1} (${hop.host}) 连接失败：${err.message || err}`);
+        }
+        jc.on('error', () => {}); // 链路异常由最终连接的 close 事件统一上报
+        this.jumpClients.push(jc);
+        // 通过本跳板机连向下一跳（或最终目标）
+        const next = i + 1 < hops.length ? hops[i + 1] : { host: cfg.host, port: cfg.port || 22 };
+        sock = await new Promise((resolve, reject) => {
+          jc.forwardOut('127.0.0.1', 0, next.host, next.port || 22, (err, s) => (err ? reject(err) : resolve(s)));
         });
-        opts.sock = stream;
       }
+      if (sock) opts.sock = sock;
+      if (hops.length) this.emit_('status', { state: 'connecting', message: '正在连接目标服务器...' });
       await this.dial(c, opts, cfg.password);
     } catch (err) {
+      this.cleanupHops();
       if (!this.closed) this.emit_('status', { state: 'failed', message: String(err.message || err) });
       return;
     }
@@ -94,11 +119,26 @@ class SSHSession extends EventEmitter {
     c.on('error', (err) => {
       if (!this.closed) this.emit_('status', { state: 'failed', message: String(err.message || err) });
     });
-    c.sftp((err, sftp) => {
-      if (err) return;
-      this.sftp = sftp;
-      this.emit_('sftp-ready', {});
-      this.startStats(cfg);
+    // SFTP 通道按需建立（首次打开文件面板/传输时），减少连接建立耗时
+    this.startStats(cfg);
+  }
+
+  // 惰性初始化 SFTP 通道；并发调用只会建立一次
+  ensureSftp() {
+    return new Promise((resolve) => {
+      if (this.sftp) return resolve(this.sftp);
+      if (!this.client || this.closed) return resolve(null);
+      if (this._sftpQ) return this._sftpQ.push(resolve);
+      this._sftpQ = [resolve];
+      this.client.sftp((err, sftp) => {
+        const q = this._sftpQ;
+        this._sftpQ = null;
+        if (!err) {
+          this.sftp = sftp;
+          this.emit_('sftp-ready', {});
+        }
+        q.forEach((r) => r(err ? null : sftp));
+      });
     });
   }
 
@@ -266,13 +306,14 @@ class SSHSession extends EventEmitter {
     };
   }
 
-  // ---------- SFTP ----------
-  sftpList(dirPath) {
-    if (!this.sftp) return this.emit_('sftp-error', { message: 'SFTP 未就绪' });
+  // ---------- SFTP（惰性建立通道） ----------
+  async sftpList(dirPath) {
+    const sftp = await this.ensureSftp();
+    if (!sftp) return this.emit_('sftp-error', { message: 'SFTP 不可用（连接未就绪）' });
     const p = dirPath || '.';
-    this.sftp.realpath(p, (err, abs) => {
+    sftp.realpath(p, (err, abs) => {
       const cwd = err ? p : abs;
-      this.sftp.readdir(cwd, (e2, list) => {
+      sftp.readdir(cwd, (e2, list) => {
         if (e2) return this.emit_('sftp-error', { message: String(e2.message || e2), cwd });
         const entries = list.map((it) => ({
           name: it.filename,
@@ -286,65 +327,69 @@ class SSHSession extends EventEmitter {
     });
   }
 
-  sftpMkdir(dirPath, name) {
-    if (!this.sftp) return;
-    this.sftp.mkdir(dirPath + '/' + name, (err) => {
+  async sftpMkdir(dirPath, name) {
+    const sftp = await this.ensureSftp();
+    if (!sftp) return;
+    sftp.mkdir(dirPath + '/' + name, (err) => {
       if (err) return this.emit_('sftp-error', { message: String(err.message || err) });
       this.sftpList(dirPath);
     });
   }
 
-  sftpDelete(dirPath, entry) {
-    if (!this.sftp) return;
+  async sftpDelete(dirPath, entry) {
+    const sftp = await this.ensureSftp();
+    if (!sftp) return;
     const target = dirPath + '/' + entry.name;
-    if (entry.isDir) this.rmdir(target, (err) => {
+    if (entry.isDir) this.rmdir(sftp, target, (err) => {
       if (err) this.emit_('sftp-error', { message: String(err.message || err) });
       this.sftpList(dirPath);
     });
-    else this.sftp.unlink(target, (err) => {
+    else sftp.unlink(target, (err) => {
       if (err) this.emit_('sftp-error', { message: String(err.message || err) });
       this.sftpList(dirPath);
     });
   }
 
-  rmdir(dir, cb) {
-    this.sftp.readdir(dir, (err, list) => {
-      if (err) return this.sftp.rmdir(dir, cb);
+  rmdir(sftp, dir, cb) {
+    sftp.readdir(dir, (err, list) => {
+      if (err) return sftp.rmdir(dir, cb);
       let pending = list.length;
-      if (!pending) return this.sftp.rmdir(dir, cb);
+      if (!pending) return sftp.rmdir(dir, cb);
       let failed = false;
       for (const it of list) {
         const t = dir + '/' + it.filename;
         const done = (e) => {
           if (e && !failed) { failed = true; cb(e); }
-          if (--pending === 0 && !failed) this.sftp.rmdir(dir, cb);
+          if (--pending === 0 && !failed) sftp.rmdir(dir, cb);
         };
-        if (it.attrs.isDirectory()) this.rmdir(t, done);
-        else this.sftp.unlink(t, done);
+        if (it.attrs.isDirectory()) this.rmdir(sftp, t, done);
+        else sftp.unlink(t, done);
       }
     });
   }
 
-  sftpRename(dirPath, oldName, newName) {
-    if (!this.sftp) return;
-    this.sftp.rename(dirPath + '/' + oldName, dirPath + '/' + newName, (err) => {
+  async sftpRename(dirPath, oldName, newName) {
+    const sftp = await this.ensureSftp();
+    if (!sftp) return;
+    sftp.rename(dirPath + '/' + oldName, dirPath + '/' + newName, (err) => {
       if (err) return this.emit_('sftp-error', { message: String(err.message || err) });
       this.sftpList(dirPath);
     });
   }
 
   // 递归下载目录 / 文件到本地；this._active 统计未完成任务数，归零即完成
-  download(remotePath, localPath, isDir) {
-    if (!this.sftp) return;
+  async download(remotePath, localPath, isDir) {
+    const sftp = await this.ensureSftp();
+    if (!sftp) return this.emit_('transfer-error', { message: 'SFTP 不可用' });
     const path = require('path');
     this._active = (this._active || 0) + 1;
     const settle = () => {
       if (--this._active === 0) this.emit_('transfer-done', {});
     };
     if (!isDir) {
-      return this.getWithProgress(remotePath, localPath, path.basename(remotePath), settle);
+      return this.getWithProgress(sftp, remotePath, localPath, path.basename(remotePath), settle);
     }
-    this.sftp.readdir(remotePath, (err, list) => {
+    sftp.readdir(remotePath, (err, list) => {
       if (err) {
         this.emit_('transfer-error', { message: String(err.message || err) });
         return settle();
@@ -357,7 +402,7 @@ class SSHSession extends EventEmitter {
           if (it.attrs.isDirectory()) this.download(rp, lp, true);
           else {
             this._active++;
-            this.getWithProgress(rp, lp, it.filename, () => {
+            this.getWithProgress(sftp, rp, lp, it.filename, () => {
               if (--this._active === 0) this.emit_('transfer-done', {});
             });
           }
@@ -367,11 +412,11 @@ class SSHSession extends EventEmitter {
     });
   }
 
-  getWithProgress(remote, local, label, cb) {
-    this.sftp.stat(remote, (err, st) => {
+  getWithProgress(sftp, remote, local, label, cb) {
+    sftp.stat(remote, (err, st) => {
       const total = err ? 0 : st.size;
       let last = 0;
-      this.sftp.fastGet(remote, local, { step: (t) => {
+      sftp.fastGet(remote, local, { step: (t) => {
         const now = Date.now();
         if (now - last > 200) {
           last = now;
@@ -384,8 +429,9 @@ class SSHSession extends EventEmitter {
     });
   }
 
-  upload(localPaths, remoteDir) {
-    if (!this.sftp) return;
+  async upload(localPaths, remoteDir) {
+    const sftp = await this.ensureSftp();
+    if (!sftp) return this.emit_('transfer-error', { message: 'SFTP 不可用' });
     const path = require('path');
     let i = 0;
     const next = () => {
@@ -393,7 +439,7 @@ class SSHSession extends EventEmitter {
       const lp = localPaths[i++];
       const name = path.basename(lp);
       let last = 0;
-      this.sftp.fastPut(lp, remoteDir + '/' + name, { step: (t, chunk, total) => {
+      sftp.fastPut(lp, remoteDir + '/' + name, { step: (t, chunk, total) => {
         const now = Date.now();
         if (now - last > 200) {
           last = now;
@@ -421,7 +467,7 @@ class SSHSession extends EventEmitter {
     this.shells.clear();
     try { this.sftp && this.sftp.end(); } catch (_) {}
     try { this.client && this.client.end(); } catch (_) {}
-    try { this.jumpClient && this.jumpClient.end(); } catch (_) {}
+    this.cleanupHops();
     this.emit_('status', { state: 'closed', message: reason || '' });
   }
 }

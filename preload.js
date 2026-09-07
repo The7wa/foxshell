@@ -22,8 +22,8 @@ contextBridge.exposeInMainWorld('api', {
 
   fwdStart: (tabId, rule) => ipcRenderer.send('fwd:start', { tabId, rule }),
   fwdStop: (tabId, ruleId) => ipcRenderer.send('fwd:stop', { tabId, ruleId }),
-  exportConns: (connections) => ipcRenderer.invoke('conns:export', { connections }),
-  importConns: () => ipcRenderer.invoke('conns:import'),
+  exportConns: (connections, password) => ipcRenderer.invoke('conns:export', { connections, password }),
+  importConns: (password, filePath) => ipcRenderer.invoke('conns:import', { password, filePath }),
   saveText: (content, defaultName) => ipcRenderer.invoke('app:saveText', { content, defaultName }),
 
   onEvent: (cb) => {
