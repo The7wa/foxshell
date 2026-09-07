@@ -1,5 +1,5 @@
 'use strict';
-/* global Terminal, FitAddon, SearchAddon */
+/* global Terminal, FitAddon, SearchAddon, WebglAddon */
 
 // ---------------- 状态 ----------------
 let conns = [];
@@ -29,6 +29,19 @@ let termCfg = Object.assign({
   cursor: 'block',
   blink: true,
 }, store.get('foxshell.termCfg', {}));
+
+const HL_DEFAULT_RULES = [
+  { word: 'ERROR', color: '#e5534b' },
+  { word: 'FAIL', color: '#e5534b' },
+  { word: 'WARN', color: '#c69026' },
+  { word: 'SUCCESS', color: '#57ab5a' },
+];
+let hlCfg = Object.assign(
+  { enabled: true, rules: HL_DEFAULT_RULES.map((r) => ({ ...r })) },
+  store.get('foxshell.hl', {})
+);
+hlCfg.inputEnabled = true;
+hlCfg.rules = Array.isArray(hlCfg.rules) && hlCfg.rules.length ? hlCfg.rules : HL_DEFAULT_RULES.map((r) => ({ ...r }));
 
 const DEFAULT_CMDS = [
   { name: '磁盘占用', cmd: 'df -h' },
@@ -61,6 +74,10 @@ function b64ToBytes(b64) {
   const arr = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
   return arr;
+}
+function evtBytes(d) {
+  if (typeof d === 'string') return b64ToBytes(d);
+  return d instanceof Uint8Array ? d : new Uint8Array(d);
 }
 function humanSize(n) {
   if (n == null) return '--';
@@ -494,6 +511,7 @@ function termOptions() {
     cursorStyle: termCfg.cursor,
     scrollback: 5000,
     theme: xtermTheme(),
+    allowProposedApi: true,
   };
 }
 
@@ -519,20 +537,29 @@ function addPane(tab, index, direction) {
   const search = new SearchAddon.SearchAddon();
   term.loadAddon(fit);
   term.loadAddon(search);
+  try {
+    const webgl = new WebglAddon.WebglAddon();
+    webgl.onContextLoss(() => { try { webgl.dispose(); } catch (_) {} });
+    term.loadAddon(webgl);
+  } catch (_) {}
   // xterm 需要挂载到独立内容层，避免与悬浮工具栏互相干扰
   const inner = document.createElement('div');
   inner.style.cssText = 'position:absolute;inset:4px 0 0 8px;';
   el.appendChild(inner);
   term.open(inner);
+  term.onResize(({ cols, rows }) => window.api.resize(tab.id, paneId, cols, rows));
 
-  const pane = { id: paneId, el, inner, term, fit, search };
+  const pane = { id: paneId, el, inner, term, fit, search, tab, hlDecorations: [], _hlMarker: null, _hlTimer: null, _cmdDecs: [], _cmdTimer: null, _cmdMarkerLine: null };
   const at = index < 0 || index > tab.panes.length ? tab.panes.length : index;
   tab.panes.splice(at, 0, pane);
 
   // 插入 DOM（按顺序重建 splitter）
   relayoutPanes(tab);
 
-  term.onData((d) => window.api.input(tab.id, paneId, d));
+  term.onData((d) => {
+    window.api.input(tab.id, paneId, d);
+    if (!d.startsWith('\x1b') && d !== '\t') scheduleCmdHighlight(pane);
+  });
   el.addEventListener('click', () => setActivePane(tab, pane));
   el.querySelector('[data-a=splitH]').addEventListener('click', (e) => {
     e.stopPropagation();
@@ -552,7 +579,7 @@ function addPane(tab, index, direction) {
   });
 
   setActivePane(tab, pane);
-  if (tab.state === 'connected') window.api.openPane(tab.id, paneId);
+  if (tab.state === 'connected') window.api.openPane(tab.id, paneId, term.cols, term.rows);
   fitAllPanes(tab);
   return pane;
 }
@@ -620,6 +647,8 @@ function fitAllPanes(tab) {
 
 function closePane(tab, pane) {
   window.api.closePane(tab.id, pane.id);
+  clearPaneHighlights(pane);
+  clearCmdDecorations(pane);
   try { pane.term.dispose(); } catch (_) {}
   pane.el.remove();
   tab.panes = tab.panes.filter((p) => p !== pane);
@@ -755,6 +784,380 @@ function disconnectOrReconnect() {
   }
 }
 
+const escapeRe = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+function hlRegex() {
+  if (!hlCfg.enabled) return null;
+  const words = (hlCfg.rules || []).map((r) => String(r.word || '').trim()).filter(Boolean);
+  if (!words.length) return null;
+  const alt = words.map((w) => (/\w$/.test(w) ? '\\b' : '') + escapeRe(w) + (/\w$/.test(w) ? '\\b' : ''));
+  return new RegExp('(?:' + alt.join('|') + ')', 'gi');
+}
+
+function hlColorFor(text) {
+  const t = text.toLowerCase();
+  const rules = hlCfg.rules || [];
+  const exact = rules.find((r) => String(r.word || '').trim().toLowerCase() === t);
+  if (exact) return exact.color;
+  const sub = rules.find((r) => {
+    const w = String(r.word || '').trim().toLowerCase();
+    return w && t.includes(w);
+  });
+  return sub ? sub.color : null;
+}
+
+function hlLineText(line) {
+  let text = '';
+  const col = [];
+  for (let x = 0; x < line.length; x++) {
+    const cell = line.getCell(x);
+    if (cell.getWidth() <= 0) continue;
+    const chars = cell.getChars() || ' ';
+    for (const ch of chars) col.push(x);
+    text += chars;
+  }
+  return { text, col };
+}
+
+function schedulePaneHighlight(pane) {
+  if (!pane || pane._hlTimer) return;
+  pane._hlTimer = setTimeout(() => {
+    pane._hlTimer = null;
+    if (document.hidden) return schedulePaneHighlight(pane);
+    try { hlScanPane(pane); } catch (_) {}
+  }, 200);
+}
+
+function hlScanPane(pane) {
+  const re = hlRegex();
+  if (!re) return;
+  const term = pane.term;
+  const buf = term.buffer.active;
+  if (!buf || !buf.length) return;
+  const startY = pane._hlMarker && !pane._hlMarker.isDisposed ? Math.max(0, pane._hlMarker.line) : 0;
+  pane.hlDecorations = pane.hlDecorations.filter(({ dec, y }) => {
+    if (y >= startY) { try { dec.dispose(); } catch (_) {} return false; }
+    return true;
+  });
+  const end = buf.length;
+  const smart = hlCfg.enabled !== false;
+  for (let y = startY; y < end; y++) {
+    const line = buf.getLine(y);
+    if (!line) continue;
+    const quick = line.translateToString(false);
+    re.lastIndex = 0;
+    const kwHit = re.test(quick);
+    if (!kwHit && !(smart && SMART_QUICK.test(quick))) continue;
+    const { text, col } = hlLineText(line);
+    const used = [];
+    const overlaps = (a, b) => used.some(([u0, u1]) => a < u1 && b > u0);
+    if (smart) hlSmartLine(pane, buf, y, line, text, col, used, overlaps);
+    if (kwHit) {
+      re.lastIndex = 0;
+      let m;
+      while ((m = re.exec(text))) {
+        if (!m[0]) { re.lastIndex++; continue; }
+        const color = hlColorFor(m[0]);
+        const a = m.index;
+        const b = a + m[0].length;
+        if (!color || overlaps(a, b)) continue;
+        used.push([a, b]);
+        const x = col[a];
+        const x2 = col[b - 1];
+        if (x == null || x2 == null || x2 < x) continue;
+        try {
+          const marker = term.registerMarker(y - (buf.baseY + buf.cursorY));
+          pane.hlDecorations.push({
+            y,
+            dec: term.registerDecoration({
+              marker,
+              x,
+              width: x2 - x + 1,
+              backgroundColor: color,
+              layer: 'bottom',
+            }),
+          });
+        } catch (_) {}
+      }
+    }
+  }
+  try {
+    if (pane._hlMarker && !pane._hlMarker.isDisposed) pane._hlMarker.dispose();
+  } catch (_) {}
+  pane._hlMarker = null;
+  try { pane._hlMarker = term.registerMarker((end - 1) - (buf.baseY + buf.cursorY)); } catch (_) {}
+}
+
+function clearPaneHighlights(pane) {
+  if (pane._hlTimer) { clearTimeout(pane._hlTimer); pane._hlTimer = null; }
+  for (const { dec } of pane.hlDecorations || []) { try { dec.dispose(); } catch (_) {} }
+  pane.hlDecorations = [];
+  try { if (pane._hlMarker && !pane._hlMarker.isDisposed) pane._hlMarker.dispose(); } catch (_) {}
+  pane._hlMarker = null;
+}
+
+function refreshAllHighlights() {
+  for (const tab of tabs.values()) {
+    for (const p of tab.panes) {
+      clearPaneHighlights(p);
+      clearCmdDecorations(p);
+      if (hlCfg.enabled) {
+        schedulePaneHighlight(p);
+        try { hlScanCmdBuffer(p); } catch (_) {}
+        scheduleCmdHighlight(p);
+      }
+    }
+  }
+}
+
+const CMD_FALLBACK = new Set(('bash sh zsh sudo su exit logout clear echo printf read cd pwd ls ll la l dir cp mv rm mkdir rmdir touch ln cat tac head tail less more nano vim vi emacs grep egrep fgrep sed awk cut sort uniq wc tr find xargs which whereis whoami id groups hostname uname date cal uptime free df du ps top htop btop kill pkill pgrep jobs bg fg nohup nice chmod chown chgrp umount mount tar gzip gunzip zip unzip bzip2 xz curl wget ping ssh scp sftp rsync git svn docker podman kubectl systemctl service journalctl dmesg iptables netstat ss ip ifconfig route traceroute mtr apt apt-get apt-cache yum dnf zypper pacman brew make cmake gcc g++ python python3 pip pip3 node npm npx java javac go rustc cargo ruby perl php lua sqlite3 mysql psql mongo mongod redis-cli redis-server screen tmux watch crontab at alias unalias export unset env source history man info type file stat tree md5sum sha256sum tee xxd base64 openssl lsof strace ltrace ldd reboot shutdown poweroff halt sleep yes true false test').split(' '));
+
+const CMD_COLORS = {
+  cmd: '#6cb2ff',
+  bad: '#e5534b',
+  opt: '#39c5cf',
+  str: '#e3b341',
+  var: '#b083f0',
+  op: '#8b949e',
+};
+
+const CMD_PROMPT_RES = [
+  /[\w.@~-]+@[\w.-]+:[^\s]*[$#]\s/,
+  /^\[[^\]]*\][$#]\s/,
+  /^bash[\d.-]*[$#]\s/,
+  /^(mysql|MariaDB|redis|mongodb|mongo|psql|pgsql|ftp|sftp|docker|python|node|irb)[^>]*>\s/i,
+  /^>{2,3}\s/,
+  /^➜\s/,
+  /^\s*[$#%>]\s/,
+];
+
+function cmdPromptEnd(text) {
+  for (const re of CMD_PROMPT_RES) {
+    const m = re.exec(text);
+    if (m && m.index <= 30) return m.index + m[0].length;
+  }
+  return -1;
+}
+
+function cmdTokenize(s) {
+  const toks = [];
+  let i = 0;
+  let expectCmd = true;
+  const isEnd = (c) => c === ' ' || c === '\t' || ';&|<>"\''.includes(c) || c === '(' || c === ')';
+  while (i < s.length) {
+    const ch = s[i];
+    if (ch === ' ' || ch === '\t') { i++; continue; }
+    if (';&|<>'.includes(ch)) {
+      let j = i + 1;
+      if (j < s.length && s[j] === ch) j++;
+      toks.push({ start: i, end: j, kind: 'op' });
+      expectCmd = true;
+      i = j;
+      continue;
+    }
+    if (ch === '(' || ch === ')') {
+      toks.push({ start: i, end: i + 1, kind: 'op' });
+      expectCmd = ch === '(';
+      i++;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      let j = i + 1;
+      while (j < s.length && s[j] !== ch) { if (s[j] === '\\') j++; j++; }
+      const end = Math.min(j + 1, s.length);
+      toks.push({ start: i, end, kind: 'str' });
+      i = end;
+      continue;
+    }
+    if (ch === '\\' && i + 1 < s.length) { i += 2; continue; }
+    let j = i + 1;
+    while (j < s.length && !isEnd(s[j])) { if (s[j] === '\\') j++; j++; }
+    const word = s.slice(i, j);
+    let kind = 'arg';
+    if (/^-{1,2}[A-Za-z][\w-]*$/.test(word)) kind = 'opt';
+    else if (/^[A-Za-z_]\w*=/.test(word)) kind = 'var';
+    else if (expectCmd) kind = 'cmd';
+    toks.push({ start: i, end: j, kind });
+    if (kind === 'cmd') expectCmd = false;
+    i = j;
+  }
+  return toks;
+}
+
+function scheduleCmdHighlight(pane) {
+  if (!pane || hlCfg.enabled === false || !hlCfg.inputEnabled || pane._cmdTimer) return;
+  pane._cmdTimer = setTimeout(() => {
+    pane._cmdTimer = null;
+    if (document.hidden) return;
+    try { hlCommandLine(pane); } catch (_) {}
+  }, 40);
+}
+
+function clearCmdDecorations(pane) {
+  if (pane._cmdTimer) { clearTimeout(pane._cmdTimer); pane._cmdTimer = null; }
+  for (const { dec } of pane._cmdDecs || []) { try { dec.dispose(); } catch (_) {} }
+  pane._cmdDecs = [];
+  pane._cmdMarkerLine = null;
+}
+
+function hlCommandLine(pane) {
+  const term = pane.term;
+  const buf = term.buffer.active;
+  if (!buf || buf.type === 'alternate') return;
+  const y = buf.baseY + buf.cursorY;
+  const line = buf.getLine(y);
+  if (!line) return;
+  pane._cmdDecs = (pane._cmdDecs || []).filter(({ dec, y: ey }) => {
+    if (ey === y) { try { dec.dispose(); } catch (_) {} return false; }
+    return true;
+  });
+  const { text, col } = hlLineText(line);
+  const start = cmdPromptEnd(text);
+  if (start < 0 || !text.slice(start).trim()) return;
+  const cmds = pane.tab && pane.tab.commands;
+  const marker = term.registerMarker(0);
+  for (const t of cmdTokenize(text.slice(start))) {
+    let color = CMD_COLORS[t.kind];
+    if (t.kind === 'cmd') {
+      const w = text.slice(start + t.start, start + t.end).toLowerCase();
+      const known = (cmds && cmds.has(w)) || CMD_FALLBACK.has(w) || w.includes('/');
+      color = known ? CMD_COLORS.cmd : CMD_COLORS.bad;
+    }
+    if (!color) continue;
+    const x = col[start + t.start];
+    const x2 = col[start + t.end - 1];
+    if (x == null || x2 == null || x2 < x) continue;
+    try {
+      pane._cmdDecs.push({
+        y,
+        dec: term.registerDecoration({
+          marker,
+          x,
+          width: x2 - x + 1,
+          foregroundColor: color,
+          layer: 'bottom',
+        }),
+      });
+    } catch (_) {}
+  }
+}
+
+function hlScanCmdBuffer(pane) {
+  const term = pane.term;
+  const buf = term.buffer.active;
+  if (!buf || buf.type === 'alternate') return;
+  for (const { dec } of pane._cmdDecs || []) { try { dec.dispose(); } catch (_) {} }
+  pane._cmdDecs = [];
+  const cmds = pane.tab && pane.tab.commands;
+  const end = buf.length;
+  const cursorAbs = buf.baseY + buf.cursorY;
+  for (let y = 0; y < end; y++) {
+    const line = buf.getLine(y);
+    if (!line) continue;
+    const quick = line.translateToString(false);
+    const start = cmdPromptEnd(quick);
+    if (start < 0 || !quick.slice(start).trim()) continue;
+    const { text, col } = hlLineText(line);
+    const s2 = cmdPromptEnd(text);
+    if (s2 < 0) continue;
+    const marker = term.registerMarker(y - cursorAbs);
+    for (const t of cmdTokenize(text.slice(s2))) {
+      let color = CMD_COLORS[t.kind];
+      if (t.kind === 'cmd') {
+        const w = text.slice(s2 + t.start, s2 + t.end).toLowerCase();
+        const known = (cmds && cmds.has(w)) || CMD_FALLBACK.has(w) || w.includes('/');
+        color = known ? CMD_COLORS.cmd : CMD_COLORS.bad;
+      }
+      if (!color) continue;
+      const x = col[s2 + t.start];
+      const x2 = col[s2 + t.end - 1];
+      if (x == null || x2 == null || x2 < x) continue;
+      try {
+        pane._cmdDecs.push({
+          y,
+          dec: term.registerDecoration({
+            marker,
+            x,
+            width: x2 - x + 1,
+            foregroundColor: color,
+            layer: 'bottom',
+          }),
+        });
+      } catch (_) {}
+    }
+  }
+  pane._cmdMarkerLine = cursorAbs;
+}
+
+const SMART_QUICK = /(?:ERROR|FATAL|CRIT|WARN|INFO|NOTICE|DEBUG|SUCCESS|DONE|FAILED|\d{4}-\d{2}-\d{2}|\d{2}:\d{2}:\d{2}|\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|\/[\w.-]+\/)/i;
+const SMART_PATTERNS = [
+  { re: /\b(?:ERROR|ERRORS|FATAL|CRITICAL|CRIT|SEVERE|PANIC|FAILED|FAILURE)\b/gi, color: '#ff7b72' },
+  { re: /\b(?:WARN|WARNING)\b/gi, color: '#e3b341' },
+  { re: /\b(?:INFO|NOTICE)\b/gi, color: '#4ec9b0' },
+  { re: /\bDEBUG\b/gi, color: '#8b949e' },
+  { re: /\b(?:SUCCESS(?:FUL|FULLY)?|DONE|COMPLETED)\b/gi, color: '#7ee787' },
+  { re: /\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?/g, color: '#8fb7d9' },
+  { re: /\b\d{2}:\d{2}:\d{2}\b/g, color: '#8fb7d9' },
+  { re: /\b\d{1,3}(?:\.\d{1,3}){3}(?::\d{1,5})?\b/g, color: '#d2a8ff' },
+  { re: /(?<=^|[\s:="'(\[])(?:[\w.@+-]+\/)+[\w.@+-]+/g, color: '#ce9178' },
+  { re: /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, color: '#9aa4ad' },
+];
+
+const HLJS_COLORS = {
+  keyword: '#ff7b72', built_in: '#d2a8ff', type: '#ffa657', title: '#d2a8ff',
+  string: '#a5d6ff', number: '#79c0ff', literal: '#79c0ff', comment: '#8b949e',
+  attr: '#7ee787', attribute: '#7ee787', variable: '#ffa657', meta: '#8b949e',
+  section: '#7ee787', tag: '#7ee787', name: '#79c0ff', symbol: '#d2a8ff',
+  operator: '#8b949e', property: '#79c0ff', selector: '#d2a8ff',
+};
+
+function hlRangeFgDefault(line, col, a, b) {
+  const x0 = col[a];
+  const x1 = col[b - 1];
+  if (x0 == null || x1 == null) return false;
+  for (let x = x0; x <= x1; x++) {
+    let cell;
+    try { cell = line.getCell(x); } catch (_) { return false; }
+    if (cell && !cell.isFgDefault()) return false;
+  }
+  return true;
+}
+
+function hlSmartLine(pane, buf, y, line, text, col, used, overlaps) {
+  const term = pane.term;
+  const addDec = (a, b, color) => {
+    const x = col[a];
+    const x2 = col[b - 1];
+    if (x == null || x2 == null || x2 < x) return;
+    if (!hlRangeFgDefault(line, col, a, b)) return;
+    try {
+      const marker = term.registerMarker(y - (buf.baseY + buf.cursorY));
+      pane.hlDecorations.push({
+        y,
+        dec: term.registerDecoration({
+          marker,
+          x,
+          width: x2 - x + 1,
+          foregroundColor: color,
+          layer: 'bottom',
+        }),
+      });
+    } catch (_) {}
+  };
+  for (const p of SMART_PATTERNS) {
+    p.re.lastIndex = 0;
+    let m;
+    while ((m = p.re.exec(text))) {
+      if (!m[0]) { p.re.lastIndex++; continue; }
+      const a = m.index;
+      const b = a + m[0].length;
+      if (overlaps(a, b)) continue;
+      used.push([a, b]);
+      addDec(a, b, p.color);
+    }
+  }
+}
+
 // ---------------- 终端外观设置 ----------------
 function applyTermCfg() {
   for (const tab of tabs.values()) {
@@ -794,6 +1197,7 @@ function openTermDialog() {
     });
     row.appendChild(chip);
   }
+  $('hlEnabled').checked = hlCfg.enabled !== false;
   $('termDialog').showModal();
 }
 
@@ -810,8 +1214,12 @@ function saveTermForm(e) {
     blink: F('blink').checked,
   };
   applyTermCfg();
+  hlCfg.enabled = $('hlEnabled').checked;
+  hlCfg.inputEnabled = true;
+  store.set('foxshell.hl', hlCfg);
+  refreshAllHighlights();
   $('termDialog').close();
-  toast('终端外观已更新');
+  toast('终端设置已更新');
 }
 
 // ---------------- 主进程事件 ----------------
@@ -821,7 +1229,12 @@ function handleEvent(evt) {
   const { type, payload } = evt;
   if (type === 'pane-data') {
     const pane = tab.panes.find((p) => p.id === payload.paneId);
-    if (pane) pane.term.write(b64ToBytes(payload.data));
+    if (pane) pane.term.write(evtBytes(payload.data), () => {
+      schedulePaneHighlight(pane);
+      scheduleCmdHighlight(pane);
+    });
+  } else if (type === 'commands') {
+    tab.commands = new Set((payload.list || []).map((s) => String(s).toLowerCase()));
   } else if (type === 'pane-ready') {
     const pane = tab.panes.find((p) => p.id === payload.paneId);
     if (pane && tab.panes.length === 1) pane.term.writeln('\x1b[32m连接成功。\x1b[0m');
@@ -836,7 +1249,10 @@ function handleEvent(evt) {
     tab.statusMsg = payload.message || '';
     if (payload.state === 'connected') {
       if (!tab.panes.length) addPane(tab, -1);
-      else window.api.openPane(tab.id, tab.panes[0].id);
+      else {
+        const p0 = tab.panes[0];
+        window.api.openPane(tab.id, p0.id, p0.term.cols, p0.term.rows);
+      }
       fitAllPanes(tab);
     } else if (payload.state === 'failed') {
       const p = tab.panes[0];
@@ -1432,6 +1848,33 @@ function bindUI() {
 }
 
 init();
+
+window.__hlDebug = function () {
+  const tab = tabs.get(activeTabId);
+  if (!tab) return console.warn('[hlDebug] 没有打开的标签页，请先连接服务器');
+  const pane = tab.panes.find((p) => p.id === tab.activePane) || tab.panes[0];
+  if (!pane) return console.warn('[hlDebug] 没有终端面板');
+  const buf = pane.term.buffer.active;
+  const line = buf.getLine(buf.baseY + buf.cursorY);
+  const text = line ? line.translateToString(false) : '';
+  const info = {
+    光标行内容: JSON.stringify(text.trimEnd()),
+    提示符截止位置: cmdPromptEnd(text),
+    服务器命令数: tab.commands ? tab.commands.size : '未加载',
+    缓冲类型: buf.type,
+    待处理定时器: !!pane._cmdTimer,
+    当前命令装饰数: pane._cmdDecs.length,
+    webgl可用: (() => { try { return new WebglAddon.WebglAddon() instanceof Object; } catch (_) { return false; } })(),
+  };
+  console.table([info]);
+  try {
+    hlCommandLine(pane);
+    console.log('[hlDebug] 手动着色完成，装饰数 =', pane._cmdDecs.length, '（若 >0 但屏幕无颜色，则是渲染层问题；若 =0，把上面表格内容发出来）');
+  } catch (e) {
+    console.error('[hlDebug] 着色异常:', e);
+  }
+  return info;
+};
 
 // 全局错误兜底：任何未捕获异常都以浮层提示，避免静默失败
 window.addEventListener('unhandledrejection', (e) => {

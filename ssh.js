@@ -18,6 +18,7 @@ class SSHSession extends EventEmitter {
     this.sftp = null;
     this._sftpQ = null; // 惰性 SFTP 初始化的等待队列
     this.shells = new Map(); // paneId -> shell stream（一个连接可开多个终端，供分屏使用）
+    this._pendingResize = new Map();
     this.forwards = new Map(); // 转发规则 id -> net.Server
     this.statsTimer = null;
     this.prev = null; // 上一帧 cpu/net 采样
@@ -35,7 +36,11 @@ class SSHSession extends EventEmitter {
     return new Promise((resolve, reject) => {
       const onError = (err) => reject(err);
       c.on('keyboard-interactive', (name, instr, lang, prompts, finish) => finish([password || '']));
-      c.once('ready', () => { c.removeListener('error', onError); resolve(); });
+      c.once('ready', () => {
+        c.removeListener('error', onError);
+        try { c.setNoDelay(true); } catch (_) {}
+        resolve();
+      });
       c.once('error', onError);
       c.connect(opts);
     });
@@ -112,6 +117,7 @@ class SSHSession extends EventEmitter {
     }
 
     this.emit_('status', { state: 'connected' });
+    this.loadCommands();
     // 连接建立后的断线检测
     c.on('close', () => {
       if (!this.closed) this.close('连接已断开');
@@ -121,6 +127,30 @@ class SSHSession extends EventEmitter {
     });
     // SFTP 通道按需建立（首次打开文件面板/传输时），减少连接建立耗时
     this.startStats(cfg);
+  }
+
+  loadCommands() {
+    if (!this.client || this.closed) return;
+    const cmd = "{ echo $PATH | tr ':' '\\n' | while read d; do ls \"$d\" 2>/dev/null; done | sort -u | head -c 100000; echo '##FS-ALIAS'; alias 2>/dev/null; }";
+    this.client.exec(cmd, (err, stream) => {
+      if (err) return;
+      let out = '';
+      stream.on('data', (d) => (out += d.toString()));
+      stream.on('close', () => {
+        if (this.closed || !out) return;
+        const idx = out.indexOf('##FS-ALIAS');
+        const list = out.slice(0, idx === -1 ? undefined : idx).split('\n')
+          .map((s) => s.trim())
+          .filter((s) => s && !s.includes('/') && !s.includes(' ') && s.length <= 64);
+        if (idx !== -1) {
+          for (const line of out.slice(idx + 9).split('\n')) {
+            const m = /^(?:alias\s+)?([\w.-]+)=/.exec(line.trim());
+            if (m) list.push(m[1]);
+          }
+        }
+        if (list.length) this.emit_('commands', { list });
+      });
+    });
   }
 
   // 惰性初始化 SFTP 通道；并发调用只会建立一次
@@ -178,16 +208,35 @@ class SSHSession extends EventEmitter {
   }
 
   // 在当前连接上打开一个新的交互终端（paneId 由渲染进程分配）
-  openShell(paneId) {
+  openShell(paneId, cols, rows) {
     if (!this.client || this.closed) {
       return this.emit_('pane-error', { paneId, message: '连接未建立' });
     }
-    this.client.shell({ term: 'xterm-256color' }, (err, stream) => {
+    this.client.shell({ term: 'xterm-256color', cols: cols || 80, rows: rows || 24 }, (err, stream) => {
       if (err) return this.emit_('pane-error', { paneId, message: String(err.message || err) });
       this.shells.set(paneId, stream);
-      stream.on('data', (d) => this.emit_('pane-data', { paneId, data: d.toString('base64') }));
-      stream.stderr.on('data', (d) => this.emit_('pane-data', { paneId, data: d.toString('base64') }));
+      const pending = this._pendingResize.get(paneId);
+      if (this._pendingResize.delete(paneId) && pending) {
+        try { stream.setWindow(pending.rows, pending.cols, 0, 0); } catch (_) {}
+      }
+      let outBuf = null;
+      let outTimer = null;
+      const flushOut = () => {
+        if (outTimer) { clearTimeout(outTimer); outTimer = null; }
+        if (!outBuf || !outBuf.length) return;
+        const data = outBuf;
+        outBuf = null;
+        this.emit_('pane-data', { paneId, data });
+      };
+      const pushOut = (d) => {
+        outBuf = outBuf ? Buffer.concat([outBuf, d]) : Buffer.from(d);
+        if (outBuf.length >= 64 * 1024) flushOut();
+        else if (!outTimer) outTimer = setTimeout(flushOut, 16);
+      };
+      stream.on('data', pushOut);
+      stream.stderr.on('data', pushOut);
       stream.on('close', () => {
+        flushOut();
         this.shells.delete(paneId);
         this.emit_('pane-closed', { paneId });
       });
@@ -205,10 +254,13 @@ class SSHSession extends EventEmitter {
     const s = this.shells.get(paneId);
     if (s) {
       try { s.setWindow(rows, cols, 0, 0); } catch (_) {}
+    } else {
+      this._pendingResize.set(paneId, { cols, rows });
     }
   }
 
   closePane(paneId) {
+    this._pendingResize.delete(paneId);
     const s = this.shells.get(paneId);
     if (s) {
       try { s.end(); } catch (_) {}
