@@ -243,7 +243,7 @@ function hardenWindowContents(contents) {
 function enableLocalOnlyRendererNetwork() {
   const ses = session.defaultSession;
   ses.webRequest.onBeforeRequest((details, callback) => {
-    const local = details.url.startsWith('file:') || details.url.startsWith('data:');
+    const local = details.url.startsWith('file:') || details.url.startsWith('data:') || details.url.startsWith('devtools:');
     callback({ cancel: !local });
   });
   ses.setPermissionRequestHandler((_wc, _permission, callback) => callback(false));
@@ -336,9 +336,9 @@ app.whenReady().then(() => {
     }
   });
 
-  ipcMain.on('ssh:openPane', (e, { tabId, paneId }) => {
+  ipcMain.on('ssh:openPane', (e, { tabId, paneId, cols, rows }) => {
     const s = sessions.get(tabId);
-    if (s) s.openShell(paneId);
+    if (s) s.openShell(paneId, cols, rows);
   });
   ipcMain.on('ssh:input', (e, { tabId, paneId, data }) => {
     const s = sessions.get(tabId);

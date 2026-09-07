@@ -20,8 +20,10 @@
     "electron-builder": "^26.15.3"
   },
   "dependencies": {
+    "@highlightjs/cdn-assets": "^11.12.0",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/addon-search": "^0.16.0",
+    "@xterm/addon-webgl": "^0.19.0",
     "@xterm/xterm": "^6.0.0",
     "ssh2": "^1.17.0"
   },
