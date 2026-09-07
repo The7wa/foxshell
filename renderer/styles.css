@@ -365,6 +365,7 @@ body {
 /* ---------- 批量执行 ---------- */
 #broadcastBox { border-bottom: 1px solid var(--border); padding: 8px 10px; }
 .broadcast-title { font-size: 11px; color: var(--text-dim); margin-bottom: 6px; }
+.broadcast-actions { display: flex; gap: 6px; margin: 0 0 7px; }
 #broadcastList { display: flex; flex-wrap: wrap; gap: 6px; }
 .bcast-chip {
   font-size: 11px;
@@ -381,6 +382,19 @@ body {
 }
 .bcast-chip.on { background: #22423a; border-color: var(--accent); color: #9fe0b0; }
 #broadcastList .none { color: var(--text-dim); font-size: 11px; }
+.batch-run-row { display: flex; gap: 6px; margin-top: 8px; }
+.batch-run-row input {
+  min-width: 0;
+  flex: 1;
+  padding: 5px 7px;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  font: 11px Consolas, monospace;
+  outline: none;
+}
+.batch-run-row input:focus { border-color: var(--accent2); }
 
 /* ---------- 终端搜索栏 ---------- */
 #searchBar {
@@ -599,3 +613,7 @@ dialog input[readonly] { color: var(--text-dim); }
 .jump-row .jump-head .jn { flex: 1; font-weight: 600; color: var(--text); }
 .jump-row .row2 { margin-bottom: 0; }
 .jump-row input { font-size: 12px; padding: 5px 8px; }
+.jump-row select { font-size: 12px; }
+.jump-saved { margin-top: 6px; }
+.jump-saved .panel-tip { padding: 5px 0 0; border: 0; }
+.jump-manual { margin-top: 6px; }
