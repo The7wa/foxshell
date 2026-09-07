@@ -85,13 +85,18 @@ class SSHSession extends EventEmitter {
           host: hop.host,
           port: hop.port || 22,
           username: hop.username || cfg.username || 'root',
-          password: hop.password,
           readyTimeout: 15000,
           keepaliveInterval: 15000,
           tryKeyboard: true,
           hostHash: hop.hostHash || cfg.hostHash || 'sha256',
           hostVerifier: hop.hostVerifier || ((_fp, done) => done(false)),
         };
+        if (hop.authType === 'key') {
+          hopOpts.privateKey = hop.keyData;
+          if (hop.passphrase) hopOpts.passphrase = hop.passphrase;
+        } else {
+          hopOpts.password = hop.password;
+        }
         if (sock) hopOpts.sock = sock; // 上一跳建立的隧道
         this.emit_('status', { state: 'connecting', message: `跳板机 ${i + 1}/${hops.length} ${hop.host}...` });
         try {

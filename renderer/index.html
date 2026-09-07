@@ -102,8 +102,16 @@
             <button id="btnCmdAdd" class="mini-btn" title="添加自定义命令">＋ 添加</button>
           </div>
           <div id="broadcastBox">
-            <div class="broadcast-title">🎯 批量执行：点选要同步的终端（未选则只发当前终端）</div>
+            <div class="broadcast-title">🎯 批量执行：选择已连接的终端</div>
+            <div class="broadcast-actions">
+              <button id="btnBroadcastAll" type="button" class="mini-btn">全选</button>
+              <button id="btnBroadcastClear" type="button" class="mini-btn">清空</button>
+            </div>
             <div id="broadcastList"></div>
+            <div class="batch-run-row">
+              <input id="batchCommand" type="text" placeholder="输入命令后，一键执行到所选主机" spellcheck="false" />
+              <button id="btnBatchRun" type="button" class="mini-btn">▶ 一键执行</button>
+            </div>
           </div>
           <div id="cmdList"></div>
           <div class="panel-tip">点击命令块即在选中的终端中执行</div>
@@ -175,10 +183,11 @@
       <div id="rowJump" style="display:none">
         <div id="jumpList"></div>
         <button type="button" id="btnJumpAdd" class="mini-btn" style="margin:4px 0 8px">＋ 添加跳板机</button>
-        <div class="panel-tip">连接顺序：跳板机 1 → 跳板机 2 → … → 目标服务器，数量不限。</div>
+        <div class="panel-tip">每一跳可选用已保存的主机配置，或手动填写。连接顺序：跳板机 1 → 跳板机 2 → … → 目标服务器。</div>
       </div>
       <div class="dialog-actions">
         <button type="button" id="btnConnCancel" class="btn">取消</button>
+        <button type="button" id="btnConnTest" class="btn">测试连接</button>
         <button type="submit" id="btnConnSave" class="btn btn-primary">保存</button>
       </div>
     </form>

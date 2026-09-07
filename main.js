@@ -313,14 +313,29 @@ app.whenReady().then(() => {
         jumps: [],
       };
       for (const j of conn.jumps || []) {
-        cfg.jumps.push({
-          host: j.host,
-          port: j.port || 22,
-          username: j.username || 'root',
-          password: dec(j.passwordEnc),
+        const saved = j.sourceConnectionId
+          ? (loadConns().connections || []).find((c) => c.id === j.sourceConnectionId)
+          : null;
+        if (j.sourceConnectionId && !saved) {
+          throw new Error(`跳板机引用的已保存主机不存在：${j.sourceConnectionId}`);
+        }
+        const source = saved || j;
+        const authType = source.authType || 'password';
+        const hop = {
+          host: source.host,
+          port: source.port || 22,
+          username: source.username || conn.username || 'root',
+          authType,
+          password: dec(source.passwordEnc),
+          passphrase: dec(source.passphraseEnc),
           hostHash: 'sha256',
-          hostVerifier: hostVerifierFor(j.host, j.port || 22),
-        });
+          hostVerifier: hostVerifierFor(source.host, source.port || 22),
+        };
+        if (authType === 'key') {
+          if (!source.keyPath) throw new Error(`跳板机 ${source.name || source.host} 未配置私钥文件`);
+          hop.keyData = await readKeyFile(source.keyPath);
+        }
+        cfg.jumps.push(hop);
       }
       if (cfg.authType === 'key') {
         if (!conn.keyPath) throw new Error('未配置私钥文件');
@@ -386,12 +401,22 @@ app.whenReady().then(() => {
         password: dec(c.passwordEnc),
         keyPath: c.keyPath || '',
         passphrase: dec(c.passphraseEnc),
-        jumps: (c.jumps || []).map((j) => ({
-          host: j.host,
-          port: j.port || 22,
-          username: j.username || '',
-          password: dec(j.passwordEnc),
-        })),
+        jumps: (c.jumps || []).map((j) => {
+          // 导出时把“引用已保存主机”展开，避免导入后因连接 ID 改变而失效。
+          const source = j.sourceConnectionId
+            ? connections.find((x) => x.id === j.sourceConnectionId)
+            : null;
+          const hop = source || j;
+          return {
+            host: hop.host,
+            port: hop.port || 22,
+            username: hop.username || '',
+            authType: hop.authType || 'password',
+            password: dec(hop.passwordEnc),
+            keyPath: hop.keyPath || '',
+            passphrase: dec(hop.passphraseEnc),
+          };
+        }),
         forwards: Array.isArray(c.forwards) ? c.forwards : [],
       }));
       const payload = encryptExportFile({ version: 1, connections: plain }, password);
@@ -450,6 +475,9 @@ app.whenReady().then(() => {
         port: j.port || 22,
         username: j.username || c.username || 'root',
         passwordEnc: enc(j.password),
+        authType: j.authType === 'key' ? 'key' : 'password',
+        keyPath: j.keyPath || '',
+        passphraseEnc: enc(j.passphrase),
       })),
       forwards: Array.isArray(c.forwards) ? c.forwards : [],
     }));

@@ -139,6 +139,7 @@ async function init() {
   extraGroups = [...new Set([...extraGroups, ...(data.groups || [])])];
   window.api.onEvent(handleEvent);
   bindUI();
+  $('batchCommand').value = store.get('foxshell.lastBatchCommand', '');
   restorePanelWidths();
   renderConnList();
   renderCmdList();
@@ -318,6 +319,7 @@ function openConnDialog(conn, clone) {
   F('password').placeholder = conn && !clone ? '留空则保持原密码' : '';
   // 跳板机链：编辑时展开为可增删的列表
   jumpDraft = (conn && Array.isArray(conn.jumps) ? conn.jumps : []).map((j) => ({
+    sourceConnectionId: j.sourceConnectionId || '',
     host: j.host || '',
     port: j.port || 22,
     username: j.username || '',
@@ -340,11 +342,15 @@ function toggleAuthRows() {
 }
 
 // ---------- 跳板机链（数量不限） ----------
-let jumpDraft = []; // 编辑中的跳板机草稿 [{host,port,username,passwordEnc,password}]
+let jumpDraft = []; // 编辑中的跳板机草稿；sourceConnectionId 存在时复用已保存的主机
 
 function addJumpRow() {
-  jumpDraft.push({ host: '', port: 22, username: '', passwordEnc: '', password: '' });
+  jumpDraft.push({ sourceConnectionId: '', host: '', port: 22, username: '', passwordEnc: '', password: '' });
   renderJumpList(true);
+}
+
+function savedJumpConnections() {
+  return conns.filter((c) => c.id !== editingConnId);
 }
 
 function renderJumpList(keepPw) {
@@ -353,6 +359,9 @@ function renderJumpList(keepPw) {
   jumpDraft.forEach((j, i) => {
     const row = document.createElement('div');
     row.className = 'jump-row';
+    const saved = savedJumpConnections();
+    const isSaved = !!j.sourceConnectionId;
+    const options = saved.map((c) => `<option value="${escapeHtml(c.id)}"${c.id === j.sourceConnectionId ? ' selected' : ''}>${escapeHtml(c.name || c.host)} (${escapeHtml(c.username || 'root')}@${escapeHtml(c.host)})</option>`).join('');
     row.innerHTML = `
       <div class="jump-head">
         <span class="jn">跳板机 ${i + 1}</span>
@@ -360,6 +369,19 @@ function renderJumpList(keepPw) {
         ${i < jumpDraft.length - 1 ? `<button type="button" data-a="down" title="下移">↓</button>` : ''}
         <button type="button" data-a="del" title="删除此跳板机">🗑</button>
       </div>
+      <label>连接方式
+        <select data-f="mode">
+          <option value="manual"${isSaved ? '' : ' selected'}>手动添加连接</option>
+          <option value="saved"${isSaved ? ' selected' : ''}>选择已保存的主机</option>
+        </select>
+      </label>
+      <div class="jump-saved"${isSaved ? '' : ' style="display:none"'}>
+        <label>已保存的主机
+          <select data-f="sourceConnectionId"><option value="">请选择主机</option>${options}</select>
+        </label>
+        <div class="panel-tip">将使用该主机当前保存的地址、认证方式和凭据。</div>
+      </div>
+      <div class="jump-manual"${isSaved ? ' style="display:none"' : ''}>
       <div class="row2">
         <label>地址 <input data-f="host" type="text" placeholder="如 10.0.0.1" value="${escapeHtml(j.host)}" /></label>
         <label>端口 <input data-f="port" type="number" min="1" max="65535" value="${j.port || 22}" /></label>
@@ -367,13 +389,18 @@ function renderJumpList(keepPw) {
       <div class="row2">
         <label>用户名 <input data-f="username" type="text" placeholder="默认同目标用户名" value="${escapeHtml(j.username)}" /></label>
         <label>密码 <input data-f="password" type="password" placeholder="${keepPw && j.passwordEnc ? '留空则保持原密码' : '无则留空'}" value="" /></label>
-      </div>`;
+      </div></div>`;
     row.querySelectorAll('[data-f]').forEach((inp) => {
-      inp.addEventListener('input', () => {
+      const update = () => {
         const f = inp.dataset.f;
-        if (f === 'port') jumpDraft[i].port = Number(inp.value) || 22;
+        if (f === 'mode') {
+          jumpDraft[i].sourceConnectionId = inp.value === 'saved' ? (saved[0]?.id || '') : '';
+          renderJumpList(keepPw);
+        } else if (f === 'port') jumpDraft[i].port = Number(inp.value) || 22;
         else jumpDraft[i][f] = inp.value;
-      });
+      };
+      inp.addEventListener('input', update);
+      inp.addEventListener('change', update);
     });
     const pwInput = row.querySelector('[data-f=password]');
     if (pwInput) pwInput.value = String(j.password || '');
@@ -397,6 +424,10 @@ function renderJumpList(keepPw) {
 
 async function saveConnForm(e) {
   e.preventDefault();
+  await saveConnectionFromForm(false);
+}
+
+async function saveConnectionFromForm(testAfterSave) {
   try {
     const f = $('connForm');
     const F = (n) => f.elements[n];
@@ -404,7 +435,7 @@ async function saveConnForm(e) {
     const old = conns.find((c) => c.id === id);
     const group = F('group').value.trim();
     const useJump = $('useJumpChk').checked;
-    const jumpRows = useJump ? jumpDraft.filter((j) => j.host.trim()) : [];
+    const jumpRows = useJump ? jumpDraft.filter((j) => j.sourceConnectionId || j.host.trim()) : [];
     const rec = {
       id,
       name: F('name').value.trim() || F('host').value.trim(),
@@ -417,15 +448,20 @@ async function saveConnForm(e) {
       keyPath: F('authType').value === 'key' ? pickedKeyPath : '',
       passphraseEnc: old ? old.passphraseEnc : '',
       jumps: jumpRows.map((j) => ({
+        sourceConnectionId: j.sourceConnectionId || '',
         host: j.host.trim(),
         port: Number(j.port) || 22,
         username: j.username.trim(),
         // 密码：新输入的用明文经 secrets 提交加密；没输入的保留原密文
-        passwordEnc: (old && old.jumps && old.jumps.some((x) => x.host === j.host.trim()) && !j.password)
+        passwordEnc: (!j.sourceConnectionId && old && old.jumps && old.jumps.some((x) => x.host === j.host.trim()) && !j.password)
           ? (old.jumps.find((x) => x.host === j.host.trim()) || {}).passwordEnc || '' : '',
       })),
       forwards: old ? old.forwards || [] : [],
     };
+    if (!rec.host) {
+      toast('请填写主机地址', true);
+      return;
+    }
     if (!rec.keyPath && rec.authType === 'key') {
       toast('请选择私钥文件', true);
       return;
@@ -458,7 +494,12 @@ async function saveConnForm(e) {
     }
     $('connDialog').close();
     renderConnList();
-    toast('连接配置已保存');
+    if (testAfterSave) {
+      toast('配置已保存，正在测试连接…');
+      connectConn(conns.find((c) => c.id === id) || rec);
+    } else {
+      toast('连接配置已保存');
+    }
   } catch (err) {
     toast('保存失败：' + (err.message || err), true);
   }
@@ -1537,6 +1578,21 @@ function runCommand(c) {
   try { pane.term.focus(); } catch (_) {}
 }
 
+function runBatchCommand() {
+  const cmd = $('batchCommand').value.trim();
+  if (!cmd) { toast('请输入要批量执行的命令', true); return; }
+  const targets = [...broadcastTargets]
+    .map((id) => tabs.get(id))
+    .filter((t) => t && t.state === 'connected');
+  if (!targets.length) { toast('请至少选择一台已连接的服务器', true); return; }
+  for (const tab of targets) {
+    const pane = tab.panes.find((p) => p.id === tab.activePane) || tab.panes[0];
+    if (pane) window.api.input(tab.id, pane.id, cmd + '\r');
+  }
+  store.set('foxshell.lastBatchCommand', cmd);
+  toast(`已一键执行到 ${targets.length} 台服务器`);
+}
+
 // ---------------- SFTP 面板 ----------------
 function renderSftpList() {
   const tab = tabs.get(activeTabId);
@@ -1627,6 +1683,7 @@ function bindUI() {
   });
   $('connForm').addEventListener('submit', saveConnForm);
   $('btnConnCancel').addEventListener('click', () => $('connDialog').close());
+  $('btnConnTest').addEventListener('click', () => saveConnectionFromForm(true));
 
   $('btnPromptCancel').addEventListener('click', () => $('promptDialog').close());
   $('promptForm').addEventListener('submit', (e) => {
@@ -1681,6 +1738,19 @@ function bindUI() {
     if ($('useJumpChk').checked && !jumpDraft.length) addJumpRow();
   });
   $('btnJumpAdd').addEventListener('click', addJumpRow);
+
+  $('btnBroadcastAll').addEventListener('click', () => {
+    broadcastTargets = new Set([...tabs.values()].filter((t) => t.state === 'connected').map((t) => t.id));
+    renderBroadcast();
+  });
+  $('btnBroadcastClear').addEventListener('click', () => {
+    broadcastTargets.clear();
+    renderBroadcast();
+  });
+  $('btnBatchRun').addEventListener('click', runBatchCommand);
+  $('batchCommand').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); runBatchCommand(); }
+  });
 
   // 端口转发
   $('btnForward').addEventListener('click', openFwdDialog);
