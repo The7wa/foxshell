@@ -349,7 +349,7 @@ class SSHSession extends EventEmitter {
     const dfCols = dfLine.trim().split(/\s+/);
     const diskTotal = Number(dfCols[1]) * 1024 || 0;
     const diskUsed = Number(dfCols[2]) * 1024 || 0;
-    const diskPct = Number(dfCols[4]) || 0;
+    const diskPct = parseInt(dfCols[4], 10) || (diskTotal ? Math.round((diskUsed / diskTotal) * 100) : 0);
     const up = Number(sec('##FS-UP').trim().split(/\s+/)[0]) || 0;
 
     return {
