@@ -1,5 +1,5 @@
 'use strict';
-const { contextBridge, ipcRenderer } = require('electron');
+const { contextBridge, ipcRenderer, webUtils } = require('electron');
 
 contextBridge.exposeInMainWorld('api', {
   loadConns: () => ipcRenderer.invoke('conns:load'),
@@ -19,6 +19,13 @@ contextBridge.exposeInMainWorld('api', {
   sftpRename: (tabId, dirPath, oldName, newName) => ipcRenderer.send('sftp:rename', { tabId, dirPath, oldName, newName }),
   sftpUpload: (tabId, dirPath) => ipcRenderer.invoke('sftp:upload', { tabId, dirPath }),
   sftpDownload: (tabId, dirPath, entry) => ipcRenderer.invoke('sftp:download', { tabId, dirPath, entry }),
+  uploadPaths: (tabId, dirPath, paths) => ipcRenderer.invoke('sftp:uploadPaths', { tabId, dirPath, paths }),
+  getPathForFile: (file) => webUtils.getPathForFile(file),
+
+  copyText: (text) => ipcRenderer.invoke('clip:copy', text),
+  pasteText: () => ipcRenderer.invoke('clip:paste'),
+
+  sftpHome: (tabId) => ipcRenderer.send('sftp:home', { tabId }),
 
   fwdStart: (tabId, rule) => ipcRenderer.send('fwd:start', { tabId, rule }),
   fwdStop: (tabId, ruleId) => ipcRenderer.send('fwd:stop', { tabId, ruleId }),
