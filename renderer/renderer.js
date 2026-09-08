@@ -1327,7 +1327,7 @@ function handleEvent(evt) {
     renderTabs();
     renderConnList();
     if (cmdVisible) renderBroadcast();
-    if (tab.id === activeTabId) { renderMonitor(); updateDisconnectBtn(); }
+    if (tab.id === activeTabId) { renderMonitor(); updateDisconnectBtn(); if (sftpVisible) refreshSftpPanel(); }
   } else if (type === 'stats') {
     tab.stats = payload;
     if (tab.id === activeTabId) renderMonitor();
@@ -1336,6 +1336,10 @@ function handleEvent(evt) {
     refreshSftpPanel();
   } else if (type === 'sftp-home') {
     tab.sftp.home = payload.path;
+    if (sftpFollowCwd && tab.id === activeTabId && tab.panes.length) {
+      const pane = tab.panes.find((p) => p.id === tab.activePane) || tab.panes[0];
+      if (pane) followTerminalCwd(pane);
+    }
   } else if (type === 'sftp-list') {
     tab.sftp.cwd = payload.cwd;
     tab.sftp.entries = payload.entries;
@@ -1467,13 +1471,41 @@ function refreshSftpPanel() {
   $('btnToggleSftp').classList.toggle('active', sftpVisible);
   if (!sftpVisible) return;
   const tab = tabs.get(activeTabId);
-  if (!tab || !tab.sftp.started) {
+  if (!tab || tab.state !== 'connected') {
     $('sftpList').innerHTML = '<div id="sftpEmpty">未连接服务器，<br>无法使用文件管理</div>';
     $('sftpPath').value = '';
     return;
   }
-  if (tab.sftp.cwd == null) window.api.sftpList(activeTabId, null);
-  else renderSftpList();
+  if (!tab.sftp.started) {
+    openSftpFirstPath(tab);
+    return;
+  }
+  if (tab.sftp.cwd == null) {
+    const t = tab.sftp._firstTarget;
+    tab.sftp._firstTarget = null;
+    window.api.sftpList(activeTabId, t || null);
+  } else {
+    renderSftpList();
+  }
+}
+
+function openSftpFirstPath(tab) {
+  let target = null;
+  if (sftpFollowCwd && tab.panes.length) {
+    const pane = tab.panes.find((p) => p.id === tab.activePane) || tab.panes[0];
+    const raw = pane ? extractPromptCwd(pane) : null;
+    if (raw && raw.startsWith('/')) target = raw;
+    else if (raw && raw.startsWith('~')) {
+      if (tab.sftp.home) target = raw === '~' ? tab.sftp.home : tab.sftp.home + raw.slice(1);
+      else if (!tab.sftp._homeAsked) {
+        tab.sftp._homeAsked = true;
+        window.api.sftpHome(tab.id);
+      }
+    }
+  }
+  tab.sftp.started = true;
+  tab.sftp._firstTarget = target;
+  window.api.sftpList(tab.id, target);
 }
 
 function refreshCmdPanel() {
