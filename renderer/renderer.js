@@ -46,6 +46,7 @@ hlCfg.rules = Array.isArray(hlCfg.rules) && hlCfg.rules.length ? hlCfg.rules : H
 const DEFAULT_CMDS = [
   { name: '磁盘占用', cmd: 'df -h' },
   { name: '内存使用', cmd: 'free -h' },
+  { name: '清理成功登录痕迹',cmd: 'cat /dev/null > /var/log/wtmp'},
   { name: '系统负载', cmd: 'uptime' },
   { name: '端口监听', cmd: 'ss -tulnp' },
   { name: '进程 TOP15 (按CPU)', cmd: 'ps aux --sort=-%cpu | head -16' },
