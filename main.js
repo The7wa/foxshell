@@ -1,5 +1,5 @@
 'use strict';
-const { app, BrowserWindow, ipcMain, dialog, safeStorage, session } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, safeStorage, session, clipboard } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
@@ -532,6 +532,28 @@ app.whenReady().then(() => {
     if (r.canceled || !r.filePath) return { ok: false };
     s.download(dirPath + '/' + entry.name, r.filePath, entry.isDir);
     return { ok: true };
+  });
+
+  ipcMain.handle('sftp:uploadPaths', (e, { tabId, dirPath, paths }) => {
+    const s = need(tabId);
+    if (!s) return { ok: false, error: '连接未建立' };
+    const list = (Array.isArray(paths) ? paths : [])
+      .filter((p) => typeof p === 'string' && p.length && fs.existsSync(p));
+    if (!list.length) return { ok: false, error: '没有可上传的有效文件' };
+    s.upload(list, dirPath || null);
+    return { ok: true };
+  });
+
+  ipcMain.handle('clip:copy', (e, text) => {
+    if (typeof text === 'string' && text) clipboard.writeText(text);
+    return { ok: true };
+  });
+
+  ipcMain.handle('clip:paste', () => clipboard.readText());
+
+  ipcMain.on('sftp:home', (e, { tabId }) => {
+    const s = need(tabId);
+    if (s) s.sftpHome();
   });
 
   createWindow();

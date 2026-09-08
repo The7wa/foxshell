@@ -177,6 +177,14 @@ class SSHSession extends EventEmitter {
     });
   }
 
+  async sftpHome() {
+    const sftp = await this.ensureSftp();
+    if (!sftp) return;
+    sftp.realpath('.', (err, abs) => {
+      if (!err && abs) this.emit_('sftp-home', { path: abs });
+    });
+  }
+
   // ---------- 端口转发（ssh -L 本地转发） ----------
   startForward(rule) {
     if (this.forwards.has(rule.id)) return;
@@ -489,14 +497,17 @@ class SSHSession extends EventEmitter {
   async upload(localPaths, remoteDir) {
     const sftp = await this.ensureSftp();
     if (!sftp) return this.emit_('transfer-error', { message: 'SFTP 不可用' });
+    if (!remoteDir) {
+      remoteDir = await new Promise((r) => sftp.realpath('.', (err, abs) => r(err ? '.' : abs)));
+    }
     const path = require('path');
-    let i = 0;
-    const next = () => {
-      if (i >= localPaths.length) return this.emit_('transfer-done', {});
-      const lp = localPaths[i++];
-      const name = path.basename(lp);
+    this._active = (this._active || 0) + 1;
+    const settle = () => {
+      if (--this._active === 0) this.emit_('transfer-done', {});
+    };
+    const putFile = (lp, rp, name) => new Promise((resolve) => {
       let last = 0;
-      sftp.fastPut(lp, remoteDir + '/' + name, { step: (t, chunk, total) => {
+      sftp.fastPut(lp, rp, { step: (t, chunk, total) => {
         const now = Date.now();
         if (now - last > 200) {
           last = now;
@@ -504,10 +515,36 @@ class SSHSession extends EventEmitter {
         }
       } }, (err) => {
         if (err) this.emit_('transfer-error', { message: String(err.message || err) });
-        next();
+        resolve();
       });
+    });
+    const walk = async (lp, rp) => {
+      await new Promise((r) => sftp.mkdir(rp, () => r()));
+      let entries;
+      try {
+        entries = await fs.promises.readdir(lp, { withFileTypes: true });
+      } catch (err) {
+        this.emit_('transfer-error', { message: String(err.message || err) });
+        return;
+      }
+      for (const ent of entries) {
+        const childLp = path.join(lp, ent.name);
+        const childRp = rp + '/' + ent.name;
+        if (ent.isDirectory()) await walk(childLp, childRp);
+        else if (ent.isFile()) await putFile(childLp, childRp, ent.name);
+      }
     };
-    next();
+    try {
+      for (const lp of localPaths) {
+        const st = await fs.promises.stat(lp);
+        const name = path.basename(lp);
+        if (st.isDirectory()) await walk(lp, remoteDir + '/' + name);
+        else await putFile(lp, remoteDir + '/' + name, name);
+      }
+    } catch (err) {
+      this.emit_('transfer-error', { message: String(err.message || err) });
+    }
+    settle();
   }
 
   close(reason) {

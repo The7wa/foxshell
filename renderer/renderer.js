@@ -58,6 +58,8 @@ let cmdList = store.get('foxshell.cmds', null) || DEFAULT_CMDS.map((c) => ({ ...
 // 批量执行：选中的广播目标 tabId
 let broadcastTargets = new Set();
 
+let sftpFollowCwd = store.get('foxshell.sftpFollow', true);
+
 // 主题预设
 const TERM_PRESETS = [
   { name: '经典黑', bg: '#101418', fg: '#d6dce2' },
@@ -534,7 +536,7 @@ function createTab(conn) {
     panes: [],
     activePane: null,
     stats: null,
-    sftp: { started: false, cwd: null, entries: [], selected: null },
+    sftp: { started: false, cwd: null, entries: [], selected: null, home: null },
   };
   tabs.set(id, tab);
   renderTabs();
@@ -590,7 +592,7 @@ function addPane(tab, index, direction) {
   term.open(inner);
   term.onResize(({ cols, rows }) => window.api.resize(tab.id, paneId, cols, rows));
 
-  const pane = { id: paneId, el, inner, term, fit, search, tab, hlDecorations: [], _hlMarker: null, _hlTimer: null, _cmdDecs: [], _cmdTimer: null, _cmdMarkerLine: null };
+  const pane = { id: paneId, el, inner, term, fit, search, tab, hlDecorations: [], _hlMarker: null, _hlTimer: null, _cmdDecs: [], _cmdTimer: null, _cmdMarkerLine: null, _cwdTimer: null };
   const at = index < 0 || index > tab.panes.length ? tab.panes.length : index;
   tab.panes.splice(at, 0, pane);
 
@@ -602,6 +604,23 @@ function addPane(tab, index, direction) {
     if (!d.startsWith('\x1b') && d !== '\t') scheduleCmdHighlight(pane);
   });
   el.addEventListener('click', () => setActivePane(tab, pane));
+  el.addEventListener('dragover', (e) => {
+    if (![...e.dataTransfer.items].some((it) => it.kind === 'file')) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+    el.classList.add('drop-target');
+  });
+  el.addEventListener('dragleave', (e) => {
+    if (!el.contains(e.relatedTarget)) el.classList.remove('drop-target');
+  });
+  el.addEventListener('drop', (e) => {
+    if (!e.dataTransfer.files.length) return;
+    e.preventDefault();
+    e.stopPropagation();
+    el.classList.remove('drop-target');
+    dropUpload(e.dataTransfer, tab, tab.sftp.cwd);
+  });
+  el.addEventListener('contextmenu', (e) => openTermContextMenu(e, pane));
   el.querySelector('[data-a=splitH]').addEventListener('click', (e) => {
     e.stopPropagation();
     addPane(tab, tab.panes.indexOf(pane) + 1, 'row');
@@ -1239,6 +1258,7 @@ function openTermDialog() {
     row.appendChild(chip);
   }
   $('hlEnabled').checked = hlCfg.enabled !== false;
+  $('followCwdChk').checked = sftpFollowCwd;
   $('termDialog').showModal();
 }
 
@@ -1258,6 +1278,8 @@ function saveTermForm(e) {
   hlCfg.enabled = $('hlEnabled').checked;
   hlCfg.inputEnabled = true;
   store.set('foxshell.hl', hlCfg);
+  sftpFollowCwd = $('followCwdChk').checked;
+  store.set('foxshell.sftpFollow', sftpFollowCwd);
   refreshAllHighlights();
   $('termDialog').close();
   toast('终端设置已更新');
@@ -1273,6 +1295,7 @@ function handleEvent(evt) {
     if (pane) pane.term.write(evtBytes(payload.data), () => {
       schedulePaneHighlight(pane);
       scheduleCmdHighlight(pane);
+      scheduleCwdFollow(pane);
     });
   } else if (type === 'commands') {
     tab.commands = new Set((payload.list || []).map((s) => String(s).toLowerCase()));
@@ -1311,6 +1334,8 @@ function handleEvent(evt) {
   } else if (type === 'sftp-ready') {
     tab.sftp.started = true;
     refreshSftpPanel();
+  } else if (type === 'sftp-home') {
+    tab.sftp.home = payload.path;
   } else if (type === 'sftp-list') {
     tab.sftp.cwd = payload.cwd;
     tab.sftp.entries = payload.entries;
@@ -1620,6 +1645,40 @@ function renderSftpList() {
       if (ent.isDir) window.api.sftpList(tab.id, tab.sftp.cwd + '/' + ent.name);
       else doDownload(ent);
     });
+    row.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'copy';
+      e.stopPropagation();
+      row.classList.add('drop-target');
+    });
+    row.addEventListener('dragleave', () => row.classList.remove('drop-target'));
+    row.addEventListener('drop', (e) => {
+      if (!e.dataTransfer.files.length) return;
+      e.preventDefault();
+      e.stopPropagation();
+      row.classList.remove('drop-target');
+      dropUpload(e.dataTransfer, tab, ent.isDir ? tab.sftp.cwd + '/' + ent.name : tab.sftp.cwd);
+    });
+    row.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      tab.sftp.selected = ent.name;
+      list.querySelectorAll('.selected').forEach((x) => x.classList.remove('selected'));
+      row.classList.add('selected');
+      const items = [];
+      if (ent.isDir) items.push({ label: '打开', run: () => window.api.sftpList(tab.id, tab.sftp.cwd + '/' + ent.name) });
+      items.push(
+        { label: '重命名', run: () => askText('重命名', ent.name, (name) => {
+            if (name && name !== ent.name) window.api.sftpRename(tab.id, tab.sftp.cwd, ent.name, name);
+          }) },
+        { label: '删除', run: () => {
+            if (confirm(`确认删除「${ent.name}」？${ent.isDir ? '（文件夹将被递归删除）' : ''}`)) {
+              window.api.sftpDelete(tab.id, tab.sftp.cwd, ent);
+            }
+          } },
+      );
+      openContextMenu(e, items);
+    });
     list.appendChild(row);
   }
 }
@@ -1640,6 +1699,127 @@ function doDownload(ent) {
   const tab = needActive();
   if (!tab || !ent) return;
   window.api.sftpDownload(tab.id, tab.sftp.cwd, ent);
+}
+
+function collectDropPaths(dt) {
+  const paths = [];
+  for (const f of dt.files) {
+    const p = window.api.getPathForFile(f);
+    if (p) paths.push(p);
+  }
+  return paths;
+}
+
+async function dropUpload(dt, tab, dirPath) {
+  if (!tab || tab.state !== 'connected') { toast('请先连接服务器', true); return; }
+  const paths = collectDropPaths(dt);
+  if (!paths.length) { toast('没有可上传的文件', true); return; }
+  const r = await window.api.uploadPaths(tab.id, dirPath, paths);
+  if (r.ok) toast(`开始上传 ${paths.length} 项到 ${dirPath || '主目录'}`);
+  else toast(r.error || '上传失败', true);
+}
+
+let ctxMenuEl = null;
+function closeCtxMenu() {
+  if (ctxMenuEl) { ctxMenuEl.remove(); ctxMenuEl = null; }
+}
+
+function openContextMenu(e, items) {
+  e.preventDefault();
+  closeCtxMenu();
+  const menu = document.createElement('div');
+  menu.className = 'ctx-menu';
+  menu.innerHTML = items.map((it, i) =>
+    `<div class="ctx-item${it.disabled ? ' disabled' : ''}" data-i="${i}">${escapeHtml(it.label)}</div>`
+  ).join('');
+  document.body.appendChild(menu);
+  const r = menu.getBoundingClientRect();
+  menu.style.left = Math.max(4, Math.min(e.clientX, window.innerWidth - r.width - 8)) + 'px';
+  menu.style.top = Math.max(4, Math.min(e.clientY, window.innerHeight - r.height - 8)) + 'px';
+  menu.addEventListener('click', (ev) => {
+    const item = ev.target.closest('.ctx-item');
+    if (!item || item.classList.contains('disabled')) return;
+    closeCtxMenu();
+    const it = items[Number(item.dataset.i)];
+    if (it && it.run) it.run();
+  });
+  ctxMenuEl = menu;
+}
+
+function openTermContextMenu(e, pane) {
+  const sel = pane.term.getSelection();
+  openContextMenu(e, [
+    {
+      label: '复制',
+      disabled: !sel,
+      run: async () => {
+        await window.api.copyText(sel);
+        toast('已复制');
+      },
+    },
+    {
+      label: '粘贴',
+      run: async () => {
+        const text = await window.api.pasteText();
+        if (text) {
+          pane.term.paste(text);
+          try { pane.term.focus(); } catch (_) {}
+        }
+      },
+    },
+  ]);
+}
+
+const CWD_PROMPT_RES = [
+  /[\w.@~-]+@[\w.-]+:([^\s]+)[#$]/,
+  /^\[[^\]]*@[^\]]*\s+([^\]]+)\][#$]/,
+  /^➜\s+(~?\/?\S+)/,
+];
+
+function extractPromptCwd(pane) {
+  const buf = pane.term.buffer.active;
+  if (!buf || buf.type !== 'normal') return null;
+  const line = buf.getLine(buf.baseY + buf.cursorY);
+  if (!line) return null;
+  const text = line.translateToString(true);
+  for (const re of CWD_PROMPT_RES) {
+    const m = re.exec(text);
+    if (m && m[1]) {
+      const p = m[1].replace(/["']/g, '');
+      if ((p.startsWith('/') || p.startsWith('~')) && !p.includes('...')) return p;
+    }
+  }
+  return null;
+}
+
+function scheduleCwdFollow(pane) {
+  if (!pane || pane._cwdTimer) return;
+  pane._cwdTimer = setTimeout(() => {
+    pane._cwdTimer = null;
+    followTerminalCwd(pane);
+  }, 400);
+}
+
+function followTerminalCwd(pane) {
+  const tab = pane.tab;
+  if (!sftpFollowCwd || !tab || tab.state !== 'connected' || !tab.sftp.started) return;
+  const raw = extractPromptCwd(pane);
+  if (!raw) return;
+  let path = raw;
+  if (path.startsWith('~')) {
+    if (!tab.sftp.home) {
+      if (!tab.sftp._homeAsked) {
+        tab.sftp._homeAsked = true;
+        window.api.sftpHome(tab.id);
+      }
+      return;
+    }
+    path = path === '~' ? tab.sftp.home : tab.sftp.home + path.slice(1);
+  }
+  if (!path.startsWith('/')) return;
+  if (path === tab.sftp.cwd || path === tab._followReq) return;
+  tab._followReq = path;
+  window.api.sftpList(tab.id, path);
 }
 
 // ---------------- 通用输入对话框 ----------------
@@ -1915,6 +2095,21 @@ function bindUI() {
       if (name && name !== ent.name) window.api.sftpRename(tab.id, tab.sftp.cwd, ent.name, name);
     });
   });
+
+  document.addEventListener('dragover', (e) => {
+    if ([...e.dataTransfer.items].some((it) => it.kind === 'file')) e.preventDefault();
+  });
+  document.addEventListener('drop', (e) => {
+    if (e.dataTransfer.files.length) e.preventDefault();
+  });
+  document.addEventListener('mousedown', (e) => {
+    if (ctxMenuEl && !ctxMenuEl.contains(e.target)) closeCtxMenu();
+  }, true);
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closeCtxMenu();
+  });
+  window.addEventListener('blur', closeCtxMenu);
+  window.addEventListener('resize', closeCtxMenu);
 }
 
 init();

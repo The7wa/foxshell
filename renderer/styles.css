@@ -617,3 +617,32 @@ dialog input[readonly] { color: var(--text-dim); }
 .jump-saved { margin-top: 6px; }
 .jump-saved .panel-tip { padding: 5px 0 0; border: 0; }
 .jump-manual { margin-top: 6px; }
+
+.term-pane.drop-target {
+  outline: 2px dashed var(--accent);
+  outline-offset: -4px;
+  background: rgba(61, 154, 80, .08) !important;
+}
+.sftp-row.drop-target { background: rgba(61, 154, 80, .25); }
+
+.ctx-menu {
+  position: fixed;
+  z-index: 1000;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 4px;
+  min-width: 120px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, .5);
+}
+.ctx-item {
+  padding: 6px 14px;
+  border-radius: 5px;
+  font-size: 13px;
+  color: var(--text);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.ctx-item:hover { background: rgba(61, 154, 80, .25); }
+.ctx-item.disabled { opacity: .4; cursor: default; }
+.ctx-item.disabled:hover { background: none; }
