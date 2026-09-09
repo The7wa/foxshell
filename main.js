@@ -219,7 +219,7 @@ function createWindow() {
     minHeight: 600,
     backgroundColor: '#1b1f24',
     title: 'FoxShell - SSH 终端',
-    icon: path.join(__dirname, 'renderer', 'icon.png'),
+    icon: path.join(__dirname, 'renderer', 'icon.ico'),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -260,6 +260,9 @@ function toRenderer(type, tabId, payload) {
 }
 
 app.whenReady().then(() => {
+  if (process.platform === 'win32') {
+    app.setAppUserModelId('com.andersen.foxshell');
+  }
   try {
     loadMasterKey();
   } catch (err) {
@@ -299,20 +302,28 @@ app.whenReady().then(() => {
   });
 
   // ---------- SSH 终端（一个连接可开多个终端面板） ----------
-  ipcMain.handle('ssh:connect', async (e, { tabId, conn }) => {
+  ipcMain.handle('ssh:connect', async (e, { tabId, conn, credentials }) => {
+    const oldSession = sessions.get(tabId);
+    if (oldSession) {
+      oldSession.close('', true);
+      sessions.delete(tabId);
+    }
     try {
+      const ephemeral = credentials || {};
       const cfg = {
         host: conn.host,
         port: conn.port || 22,
         username: conn.username || 'root',
         authType: conn.authType || 'password',
-        password: dec(conn.passwordEnc),
-        passphrase: dec(conn.passphraseEnc),
+        password: ephemeral.password || dec(conn.passwordEnc),
+        passphrase: ephemeral.passphrase || dec(conn.passphraseEnc),
         hostHash: 'sha256',
         hostVerifier: hostVerifierFor(conn.host, conn.port || 22),
         jumps: [],
       };
-      for (const j of conn.jumps || []) {
+      const jumpCredentials = Array.isArray(ephemeral.jumps) ? ephemeral.jumps : [];
+      for (let i = 0; i < (conn.jumps || []).length; i++) {
+        const j = conn.jumps[i];
         const saved = j.sourceConnectionId
           ? (loadConns().connections || []).find((c) => c.id === j.sourceConnectionId)
           : null;
@@ -326,8 +337,12 @@ app.whenReady().then(() => {
           port: source.port || 22,
           username: source.username || conn.username || 'root',
           authType,
-          password: dec(source.passwordEnc),
-          passphrase: dec(source.passphraseEnc),
+          password: saved
+            ? dec(source.passwordEnc)
+            : (jumpCredentials[i] || dec(j.passwordEnc)),
+          passphrase: saved
+            ? dec(source.passphraseEnc)
+            : dec(j.passphraseEnc),
           hostHash: 'sha256',
           hostVerifier: hostVerifierFor(source.host, source.port || 22),
         };

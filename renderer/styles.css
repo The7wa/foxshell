@@ -562,6 +562,26 @@ dialog input, dialog select {
 }
 dialog input:focus, dialog select:focus { border-color: var(--accent2); }
 dialog input[readonly] { color: var(--text-dim); }
+.secret-control {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  margin-top: 4px;
+}
+.secret-control input {
+  flex: 1;
+  min-width: 0;
+  width: auto;
+  margin-top: 0;
+}
+.secret-toggle {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+.secret-toggle.showing {
+  color: var(--accent2);
+  border-color: var(--accent2);
+}
 .row2 { display: flex; gap: 10px; }
 .row2 label { flex: 1; }
 .hl-row { display: flex; gap: 6px; margin-bottom: 6px; align-items: center; }

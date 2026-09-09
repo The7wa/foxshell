@@ -34,15 +34,34 @@ class SSHSession extends EventEmitter {
   // 用一个 Client 发起连接（支持 keyboard-interactive），Promise 化
   dial(c, opts, password) {
     return new Promise((resolve, reject) => {
-      const onError = (err) => reject(err);
-      c.on('keyboard-interactive', (name, instr, lang, prompts, finish) => finish([password || '']));
+      let authPassword = password || '';
+      const onKeyboardInteractive = (name, instr, lang, prompts, finish) => finish([authPassword || '']);
+      const clearAuth = () => {
+        authPassword = '';
+        if (opts.password) opts.password = '';
+        if (opts.passphrase) opts.passphrase = '';
+        if (opts.privateKey) opts.privateKey = null;
+      };
+      const onError = (err) => {
+        c.removeListener('keyboard-interactive', onKeyboardInteractive);
+        clearAuth();
+        reject(err);
+      };
       c.once('ready', () => {
         c.removeListener('error', onError);
+        c.removeListener('keyboard-interactive', onKeyboardInteractive);
+        clearAuth();
         try { c.setNoDelay(true); } catch (_) {}
         resolve();
       });
+      c.on('keyboard-interactive', onKeyboardInteractive);
       c.once('error', onError);
-      c.connect(opts);
+      try {
+        c.connect(opts);
+      } catch (err) {
+        clearAuth();
+        reject(err);
+      }
     });
   }
 
@@ -54,7 +73,6 @@ class SSHSession extends EventEmitter {
   }
 
   async connect(cfg) {
-    this.cfg = cfg;
     const c = new Client();
     this.client = c;
     const opts = {
@@ -100,7 +118,11 @@ class SSHSession extends EventEmitter {
         if (sock) hopOpts.sock = sock; // 上一跳建立的隧道
         this.emit_('status', { state: 'connecting', message: `跳板机 ${i + 1}/${hops.length} ${hop.host}...` });
         try {
-          await this.dial(jc, hopOpts, hop.password);
+          const hopPassword = hop.password || '';
+          hop.password = '';
+          hop.passphrase = '';
+          hop.keyData = null;
+          await this.dial(jc, hopOpts, hopPassword);
         } catch (err) {
           throw new Error(`跳板机 ${i + 1} (${hop.host}) 连接失败：${err.message || err}`);
         }
@@ -114,7 +136,12 @@ class SSHSession extends EventEmitter {
       }
       if (sock) opts.sock = sock;
       if (hops.length) this.emit_('status', { state: 'connecting', message: '正在连接目标服务器...' });
-      await this.dial(c, opts, cfg.password);
+      let targetPassword = cfg.password || '';
+      cfg.password = '';
+      cfg.passphrase = '';
+      cfg.keyData = null;
+      await this.dial(c, opts, targetPassword);
+      targetPassword = '';
     } catch (err) {
       this.cleanupHops();
       if (!this.closed) this.emit_('status', { state: 'failed', message: String(err.message || err) });
@@ -547,7 +574,7 @@ class SSHSession extends EventEmitter {
     settle();
   }
 
-  close(reason) {
+  close(reason, silent) {
     if (this.closed) return;
     this.closed = true;
     if (this.statsTimer) clearInterval(this.statsTimer);
@@ -562,7 +589,7 @@ class SSHSession extends EventEmitter {
     try { this.sftp && this.sftp.end(); } catch (_) {}
     try { this.client && this.client.end(); } catch (_) {}
     this.cleanupHops();
-    this.emit_('status', { state: 'closed', message: reason || '' });
+    if (!silent) this.emit_('status', { state: 'closed', message: reason || '' });
   }
 }
 

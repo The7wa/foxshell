@@ -1,6 +1,6 @@
 {
   "name": "foxshell",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "FoxShell - SSH 连接管理客户端",
   "main": "main.js",
   "scripts": {
@@ -48,7 +48,7 @@
         "nsis",
         "portable"
       ],
-      "icon": "renderer/icon.png"
+      "icon": "renderer/icon.ico"
     },
     "nsis": {
       "oneClick": false,

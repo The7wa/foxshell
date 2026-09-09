@@ -335,7 +335,40 @@ function openConnDialog(conn, clone) {
   $('keyPathText').value = pickedKeyPath || '';
   $('groupSuggestions').innerHTML = allGroupNames().map((g) => `<option value="${escapeHtml(g)}">`).join('');
   toggleAuthRows();
+  resetSecretToggles();
   $('connDialog').showModal();
+}
+
+function bindSecretToggle(btn, input) {
+  btn.addEventListener('click', () => {
+    const show = input.type === 'password';
+    input.type = show ? 'text' : 'password';
+    btn.textContent = show ? '隐藏' : '显示';
+    btn.classList.toggle('showing', show);
+    input.focus();
+  });
+}
+
+function resetSecretToggles() {
+  for (const input of document.querySelectorAll('.secret-control input')) {
+    if (input.type !== 'text') continue;
+    input.type = 'password';
+    const control = input.closest('.secret-control');
+    const btn = control && control.querySelector('.secret-toggle');
+    if (btn) {
+      btn.textContent = '显示';
+      btn.classList.remove('showing');
+    }
+  }
+}
+
+function clearConnSecretForm() {
+  const f = $('connForm');
+  if (!f) return;
+  if (f.elements.password) f.elements.password.value = '';
+  if (f.elements.passphrase) f.elements.passphrase.value = '';
+  for (const j of jumpDraft) j.password = '';
+  resetSecretToggles();
 }
 
 function toggleAuthRows() {
@@ -391,7 +424,12 @@ function renderJumpList(keepPw) {
       </div>
       <div class="row2">
         <label>用户名 <input data-f="username" type="text" placeholder="默认同目标用户名" value="${escapeHtml(j.username)}" /></label>
-        <label>密码 <input data-f="password" type="password" placeholder="${keepPw && j.passwordEnc ? '留空则保持原密码' : '无则留空'}" value="" /></label>
+        <label>密码
+          <span class="secret-control">
+            <input data-f="password" type="password" placeholder="${keepPw && j.passwordEnc ? '留空则保持原密码' : '无则留空'}" value="" />
+            <button type="button" data-a="showPassword" class="mini-btn secret-toggle">显示</button>
+          </span>
+        </label>
       </div></div>`;
     row.querySelectorAll('[data-f]').forEach((inp) => {
       const update = () => {
@@ -407,6 +445,8 @@ function renderJumpList(keepPw) {
     });
     const pwInput = row.querySelector('[data-f=password]');
     if (pwInput) pwInput.value = String(j.password || '');
+    const pwBtn = row.querySelector('[data-a=showPassword]');
+    if (pwBtn && pwInput) bindSecretToggle(pwBtn, pwInput);
     row.querySelector('[data-a=del]').addEventListener('click', () => {
       jumpDraft.splice(i, 1);
       renderJumpList(keepPw);
@@ -519,31 +559,19 @@ async function saveConnectionFromForm(testAfterSave = false) {
     // ============================================================
 
     if (testAfterSave) {
-      // 临时把当前输入的密码放进去，
-      // 让 connectConn 可以使用当前输入的密码。
-      //
-      // 不修改原来的 conns。
-      const testRec = {
-        ...rec,
-
-        // 如果用户刚刚输入了密码，优先使用当前密码
-        _password: F('password').value || '',
-
-        // 当前输入的私钥口令
-        _passphrase: F('passphrase').value || '',
-
-        // 跳板机当前输入的密码
-        jumps: rec.jumps.map((j, index) => ({
-          ...j,
-          _password: jumpRows[index]?.password || '',
-        })),
+      // 不把表单密码放进标签/连接对象，只通过独立凭据参数短暂传给主进程。
+      const testConn = { ...rec };
+      const testCredentials = {
+        password: F('password').value || '',
+        passphrase: F('passphrase').value || '',
+        jumps: jumpRows.map((j) => j.password || ''),
       };
 
       toast('正在测试连接…');
 
       // 直接使用现有连接函数
       // 不保存、不加入 conns
-      connectConn(testRec);
+      connectConn(testConn, testCredentials);
 
       return;
     }
@@ -612,13 +640,14 @@ async function saveConnectionFromForm(testAfterSave = false) {
 
 
 // ---------------- 标签页 / 终端（支持分屏多面板） ----------------
-function connectConn(conn) {
+function connectConn(conn, credentials) {
   const existing = [...tabs.values()].find((t) => t.connId === conn.id && t.state !== 'closed');
-  if (existing) return activateTab(existing.id);
-  createTab(conn);
+  if (existing && existing.state !== 'failed') return activateTab(existing.id);
+  if (existing) closeTab(existing.id);
+  createTab(conn, credentials);
 }
 
-function createTab(conn) {
+function createTab(conn, credentials) {
   const id = uid();
   const wrap = document.createElement('div');
   wrap.className = 'term-wrap hidden';
@@ -647,7 +676,30 @@ function createTab(conn) {
   activateTab(id);
   addPane(tab, -1); // 第一个终端面板
   if (cmdVisible) renderBroadcast();
-  window.api.connect(id, conn);
+  window.api.connect(id, conn, credentials);
+}
+
+function retryCurrentTab(tab) {
+  const retryConn = conns.find((c) => c.id === tab.connId) || tab.conn;
+  tab.state = 'connecting';
+  tab.statusMsg = '正在重新连接…';
+  tab.stats = null;
+  tab.sftp = { started: false, cwd: null, entries: [], selected: null, home: null };
+  tab.commands = null;
+  for (const p of tab.panes) {
+    try { p.term.reset(); } catch (_) {}
+  }
+  const p = tab.panes[0];
+  if (p) p.term.writeln('\r\n\x1b[33m正在重新连接…\x1b[0m');
+  renderTabs();
+  renderConnList();
+  if (cmdVisible) renderBroadcast();
+  window.api.connect(tab.id, retryConn);
+  if (tab.id === activeTabId) {
+    renderMonitor();
+    updateDisconnectBtn();
+    if (sftpVisible) refreshSftpPanel();
+  }
 }
 
 function termOptions() {
@@ -704,6 +756,10 @@ function addPane(tab, index, direction) {
   relayoutPanes(tab);
 
   term.onData((d) => {
+    if (tab.state === 'failed' && (d === '\r' || d === '\n')) {
+      retryCurrentTab(tab);
+      return;
+    }
     window.api.input(tab.id, paneId, d);
     if (!d.startsWith('\x1b') && d !== '\t') scheduleCmdHighlight(pane);
   });
@@ -1424,7 +1480,10 @@ function handleEvent(evt) {
       fitAllPanes(tab);
     } else if (payload.state === 'failed') {
       const p = tab.panes[0];
-      if (p) p.term.writeln(`\r\n\x1b[31m连接失败：${payload.message || '未知错误'}\x1b[0m`);
+      if (p) {
+        p.term.writeln(`\r\n\x1b[31m连接失败：${payload.message || '未知错误'}\x1b[0m`);
+        p.term.writeln(`\x1b[33m按回车键重新连接。\x1b[0m`);
+      }
     } else if (payload.state === 'closed' && payload.message) {
       for (const p of tab.panes) p.term.writeln(`\r\n\x1b[33m${payload.message}\x1b[0m`);
     }
@@ -2000,6 +2059,9 @@ function bindUI() {
   $('connForm').addEventListener('submit', saveConnForm);
   $('btnConnCancel').addEventListener('click', () => $('connDialog').close());
   $('btnConnTest').addEventListener('click', () => saveConnectionFromForm(true));
+  $('connDialog').addEventListener('close', clearConnSecretForm);
+  bindSecretToggle($('btnTogglePassword'), $('connForm').elements.password);
+  bindSecretToggle($('btnTogglePassphrase'), $('connForm').elements.passphrase);
 
   $('btnPromptCancel').addEventListener('click', () => $('promptDialog').close());
   $('promptForm').addEventListener('submit', (e) => {

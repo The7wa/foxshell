@@ -6,7 +6,7 @@ contextBridge.exposeInMainWorld('api', {
   saveConns: (data) => ipcRenderer.invoke('conns:save', data),
   pickKeyFile: () => ipcRenderer.invoke('app:pickKeyFile'),
 
-  connect: (tabId, conn) => ipcRenderer.invoke('ssh:connect', { tabId, conn }),
+  connect: (tabId, conn, credentials) => ipcRenderer.invoke('ssh:connect', { tabId, conn, credentials }),
   openPane: (tabId, paneId, cols, rows) => ipcRenderer.send('ssh:openPane', { tabId, paneId, cols, rows }),
   input: (tabId, paneId, data) => ipcRenderer.send('ssh:input', { tabId, paneId, data }),
   resize: (tabId, paneId, cols, rows) => ipcRenderer.send('ssh:resize', { tabId, paneId, cols, rows }),

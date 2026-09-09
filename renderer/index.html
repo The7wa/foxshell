@@ -13,7 +13,7 @@
     <!-- 左栏：连接管理器（文件夹分组） -->
     <aside id="sidebar">
       <div class="side-header">
-        <img src="logo.svg" class="logo-img" alt="FoxShell" />
+        <img src="logo.png" class="logo-img" alt="FoxShell" />
         <span class="logo">FoxShell</span>
       </div>
       <div class="side-search">
@@ -49,7 +49,7 @@
         <!-- 中间：终端 + 监控 -->
         <div id="center">
           <div id="welcome">
-            <img src="logo.svg" class="welcome-logo-img" alt="FoxShell" />
+            <img src="logo.png" class="welcome-logo-img" alt="FoxShell" />
             <h2>FoxShell</h2>
             <p>双击左侧主机建立 SSH 连接</p>
             <p class="dim">支持密码 / 密钥登录 · 跳板机 · SFTP · 资源监控 · 分屏终端 · 快捷命令</p>
@@ -169,7 +169,12 @@
           <option value="key">私钥登录</option>
         </select>
       </label>
-      <label id="rowPassword">密码 <input name="password" type="password" placeholder="留空则保持原密码" /></label>
+      <label id="rowPassword">密码
+        <span class="secret-control">
+          <input name="password" type="password" placeholder="留空则保持原密码" />
+          <button type="button" id="btnTogglePassword" class="mini-btn secret-toggle">显示</button>
+        </span>
+      </label>
       <div id="rowKey">
         <label>私钥文件
           <div class="keyfile">
@@ -177,7 +182,12 @@
             <button type="button" id="btnPickKey" class="mini-btn">选择...</button>
           </div>
         </label>
-        <label>私钥口令 <input name="passphrase" type="password" placeholder="无则留空" /></label>
+        <label>私钥口令
+          <span class="secret-control">
+            <input name="passphrase" type="password" placeholder="无则留空" />
+            <button type="button" id="btnTogglePassphrase" class="mini-btn secret-toggle">显示</button>
+          </span>
+        </label>
       </div>
       <label class="check-line"><input type="checkbox" id="useJumpChk" /> 通过跳板机（堡垒机）连接</label>
       <div id="rowJump" style="display:none">
