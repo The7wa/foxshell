@@ -1,4 +1,5 @@
 # FoxShell
+<img width="1024" height="1024" alt="logo" src="https://github.com/user-attachments/assets/d111f871-d718-425d-8f04-58e672efdd0a" />
 
 SSH 连接管理工具：多标签终端 · 分屏 · SFTP · 资源监控 · 批量执行 · 端口转发 · 跳板机。
 
