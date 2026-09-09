@@ -430,15 +430,26 @@ async function saveConnForm(e) {
   await saveConnectionFromForm(false);
 }
 
-async function saveConnectionFromForm(testAfterSave) {
+
+async function saveConnectionFromForm(testAfterSave = false) {
   try {
     const f = $('connForm');
     const F = (n) => f.elements[n];
+
+    // ============================================================
+    // 1. 从表单读取配置
+    // ============================================================
+
     const id = editingConnId || uid().replace('t', 'c');
     const old = conns.find((c) => c.id === id);
+
     const group = F('group').value.trim();
     const useJump = $('useJumpChk').checked;
-    const jumpRows = useJump ? jumpDraft.filter((j) => j.sourceConnectionId || j.host.trim()) : [];
+
+    const jumpRows = useJump
+      ? jumpDraft.filter((j) => j.sourceConnectionId || j.host.trim())
+      : [];
+
     const rec = {
       id,
       name: F('name').value.trim() || F('host').value.trim(),
@@ -447,66 +458,158 @@ async function saveConnectionFromForm(testAfterSave) {
       username: F('username').value.trim() || 'root',
       group,
       authType: F('authType').value,
+
+      // 原配置保留
       passwordEnc: old ? old.passwordEnc : '',
-      keyPath: F('authType').value === 'key' ? pickedKeyPath : '',
+
+      keyPath: F('authType').value === 'key'
+        ? pickedKeyPath
+        : '',
+
       passphraseEnc: old ? old.passphraseEnc : '',
+
       jumps: jumpRows.map((j) => ({
         sourceConnectionId: j.sourceConnectionId || '',
         host: j.host.trim(),
         port: Number(j.port) || 22,
         username: j.username.trim(),
-        // 密码：新输入的用明文经 secrets 提交加密；没输入的保留原密文
-        passwordEnc: (!j.sourceConnectionId && old && old.jumps && old.jumps.some((x) => x.host === j.host.trim()) && !j.password)
-          ? (old.jumps.find((x) => x.host === j.host.trim()) || {}).passwordEnc || '' : '',
+
+        passwordEnc:
+          (
+            !j.sourceConnectionId &&
+            old &&
+            old.jumps &&
+            old.jumps.some((x) => x.host === j.host.trim()) &&
+            !j.password
+          )
+            ? (
+                old.jumps.find((x) => x.host === j.host.trim()) || {}
+              ).passwordEnc || ''
+            : '',
       })),
+
       forwards: old ? old.forwards || [] : [],
     };
+
+    // ============================================================
+    // 2. 基本检查
+    // ============================================================
+
     if (!rec.host) {
       toast('请填写主机地址', true);
       return;
     }
+
     if (!rec.keyPath && rec.authType === 'key') {
       toast('请选择私钥文件', true);
       return;
     }
+
     if (useJump && !jumpRows.length) {
       toast('请至少添加一台跳板机地址', true);
       return;
     }
-    if (group && !allGroupNames().includes(group)) extraGroups = [...extraGroups, group];
+
+    // ============================================================
+    // 3. 测试连接
+    //    注意：
+    //    这里直接使用当前表单配置。
+    //    不修改 conns
+    //    不调用 saveConns
+    // ============================================================
+
+    if (testAfterSave) {
+      // 临时把当前输入的密码放进去，
+      // 让 connectConn 可以使用当前输入的密码。
+      //
+      // 不修改原来的 conns。
+      const testRec = {
+        ...rec,
+
+        // 如果用户刚刚输入了密码，优先使用当前密码
+        _password: F('password').value || '',
+
+        // 当前输入的私钥口令
+        _passphrase: F('passphrase').value || '',
+
+        // 跳板机当前输入的密码
+        jumps: rec.jumps.map((j, index) => ({
+          ...j,
+          _password: jumpRows[index]?.password || '',
+        })),
+      };
+
+      toast('正在测试连接…');
+
+      // 直接使用现有连接函数
+      // 不保存、不加入 conns
+      connectConn(testRec);
+
+      return;
+    }
+
+    // ============================================================
+    // 4. 以下才是真正的保存逻辑
+    // ============================================================
+
+    if (group && !allGroupNames().includes(group)) {
+      extraGroups = [...extraGroups, group];
+    }
+
     const secrets = {
       [id]: {
         password: F('password').value,
         passphrase: F('passphrase').value,
       },
-      jumps: { [id]: jumpRows.map((j) => j.password || '') },
+
+      jumps: {
+        [id]: jumpRows.map((j) => j.password || ''),
+      },
     };
-    if (old) Object.assign(old, rec); // 原地更新，保持引用（tab.conn 同步）
-    else conns.push(rec);
+
+    // 更新/新增连接
+    if (old) {
+      Object.assign(old, rec);
+    } else {
+      conns.push(rec);
+    }
+
     store.set('foxshell.groups', extraGroups);
-    const updated = await window.api.saveConns({ connections: conns, groups: allGroupNames(), secrets });
+
+    const updated = await window.api.saveConns({
+      connections: conns,
+      groups: allGroupNames(),
+      secrets,
+    });
+
     if (updated && updated.connections) {
       for (const u of updated.connections) {
         const c = conns.find((x) => x.id === u.id);
+
         if (c) {
           c.passwordEnc = u.passwordEnc;
           c.passphraseEnc = u.passphraseEnc;
-          c.jumps = Array.isArray(u.jumps) ? u.jumps.map((j) => ({ ...j })) : [];
+
+          c.jumps = Array.isArray(u.jumps)
+            ? u.jumps.map((j) => ({ ...j }))
+            : [];
         }
       }
     }
+
+    // 保存成功后关闭窗口
     $('connDialog').close();
+
     renderConnList();
-    if (testAfterSave) {
-      toast('配置已保存，正在测试连接…');
-      connectConn(conns.find((c) => c.id === id) || rec);
-    } else {
-      toast('连接配置已保存');
-    }
+
+    toast('连接配置已保存');
+
   } catch (err) {
+    console.error(err);
     toast('保存失败：' + (err.message || err), true);
   }
 }
+
 
 // ---------------- 标签页 / 终端（支持分屏多面板） ----------------
 function connectConn(conn) {
